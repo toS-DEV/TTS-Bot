@@ -1,0 +1,21 @@
+[project]
+name = "simplettsbot"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "coloredlogs>=15.0.1",
+    "discord>=2.3.2",
+    "dotenv>=0.9.9",
+    "requests>=2.34.2",
+    "typing>=3.10.0.0",
+    "typing-extensions>=4.16.0",
+]
+
+[project.scripts]
+simplettsbot = "simplettsbot:main"
+
+[build-system]
+requires = ["uv_build>=0.12.3,<0.13.0"]
+build-backend = "uv_build"
