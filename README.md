@@ -325,4 +325,4 @@ function deleteCurrentTrigger(functionName) {
     }
   }
   Logger.log(`${count} 個のトリガーを掃除したよ。`);
-}# TTS-Bot
+}
