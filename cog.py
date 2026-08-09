@@ -7,15 +7,18 @@ import random
 import re
 import unicodedata
 from collections import OrderedDict
+from collections.abc import Callable
+from contextlib import suppress
 from datetime import datetime, timezone
-from typing import Any, Callable, TypedDict, cast
+from pathlib import Path
+from typing import Any, TypedDict, cast
 
 import discord
 import requests
 from aiohttp import web
 from discord import app_commands
 from discord.ext import commands, tasks
-from typing_extensions import NotRequired
+from typing_extensions import NotRequired, override
 
 import logic
 from cache_manager import VoiceCacheManager
@@ -25,13 +28,11 @@ from models import Models
 
 class TTSQueueItem(TypedDict):
     guild_id: int
-    group_id: NotRequired[int]
+    group_id: NotRequired[str]
     author_id: NotRequired[int]
     content: NotRequired[str]
     file_path: NotRequired[str | None]
-    # メッセージ内での分割順序（0始まりのインデックス）
     sequence_number: NotRequired[int]
-    # メッセージが何分割されているか（全分割数）
     total_segments: NotRequired[int]
 
 
@@ -54,11 +55,6 @@ class TTSCog(commands.Cog):
     bot: commands.Bot
     logger: logging.Logger
 
-    async def cog_load(self) -> None:
-        raise NotImplementedError()
-
-    def on_close(self) -> None:
-        raise NotImplementedError()
 
     text_channels: dict[int, discord.TextChannel]
     voice_clients: dict[int, discord.VoiceClient]
@@ -88,7 +84,6 @@ class TTSCog(commands.Cog):
         self.bot = bot
         self.logger = logging.getLogger("bot.ttscog")
 
-        # 1. 基本的な辞書と状態の初期化
         self.text_channels = {}
         self.voice_clients = {}
         self.voice_channels = {}
@@ -96,61 +91,47 @@ class TTSCog(commands.Cog):
         self.is_reading = {}
         self.last_speaker_id = {}
         self.last_speak_time = {}
-
-        # 2. マネージャー・設定関連の初期化
         self.dict_manager = DictionaryManager()
         self.cache_manager = VoiceCacheManager(max_size_mb=2048)
         self.config_path = "auto_join_config.json"
         self.auto_join_configs = self._load_auto_join_configs()
-
-        # 3. ユーザー設定（オーナー情報）
-        self.owner_id = int(os.environ.get("OWNER_ID", 0))
+        self.owner_id = int(os.getenv("OWNER_ID", "0"))
         self.owner_display_name = os.getenv("OWNER_DISPLAY_NAME", "マスター")
-
-        # 4. 非同期オブジェクトの初期化 (Noneを許容せず、ここで実体化)
         self.queue = asyncio.Queue()
         self.play_waiting_queue = asyncio.Queue()
         self._queue_lock = asyncio.Lock()
         self.next_event = asyncio.Event()
         self.api_semaphore = asyncio.Semaphore(1)
-
-        # 5. 再生制御バッファの初期化（グループベース）
-        # play_groups: guild_id -> OrderedDict[group_id -> Group]
         self.play_groups = {}
-        # Legacy counter for items that don't include a group_id (backcompat)
         self.play_group_counters = {}
-        # Per-guild per-group timers (kept for quick lookup if needed)
         self.play_wait_start = {}
-
         self.loop = bot.loop
-
         self.se_dir = "Extra/EX_Voice"
         self._update_se_keywords()
         self._http_server_task: asyncio.Task | None = None
 
-    async def cog_load(self):
-        """ボットのイベントループが開始された後に呼び出される初期化メソッドだよ"""
+    @staticmethod
+    def _read_prefs_file(path: str) -> dict[str, Any]:
+        with open(path, "r", encoding="utf-8") as f:
+            return cast(dict[str, Any], json.load(f))
+    
+    @override
+    async def cog_load(self) -> None:
         logger = self.logger.getChild("cog_load")
         if os.path.isfile("prefs.json"):
             try:
-                with open("prefs.json", "r") as f:
-                    self.prefs = json.load(f)
+                # 2. 呼び出すときは self._read_prefs_file にする！
+                self.prefs = await asyncio.to_thread(self._read_prefs_file, "prefs.json")
                 logger.info("Loaded preferences")
             except Exception:
                 logger.exception("Failed to load prefs.json")
-
-        # 正しいイベントループ上で非同期オブジェクトを作成
         self.queue = asyncio.Queue()
         self.play_waiting_queue = asyncio.Queue()
         self._queue_lock = asyncio.Lock()
         self.next_event = asyncio.Event()
         self.api_semaphore = asyncio.Semaphore(1)
-
-        # ループの開始
         self.queue = asyncio.Queue()
         self.play_waiting_queue = asyncio.Queue()
-
-        # ループの開始
         if not self.generation_loop.is_running():
             self.generation_loop.start()
         if not self.playback_loop.is_running():
@@ -160,7 +141,6 @@ class TTSCog(commands.Cog):
             if self._http_server_task is not None and not self._http_server_task.done():
                 logger.info("HTTP server is already running. Skipping duplicate startup.")
             else:
-                # まだ動いていない、または古いタスクが死んでいる場合だけ新しく起動する
                 self._http_server_task = asyncio.create_task(self.start_http_server())
                 logger.info("Started HTTP server task for bump notifications")
         except Exception:
@@ -192,7 +172,6 @@ class TTSCog(commands.Cog):
         if os.path.exists(se_dir):
             for file in os.listdir(se_dir):
                 if file.endswith((".wav", ".mp3")):
-                    # 拡張子を除いた名前をキーワードにする（例: キラーン.wav -> キラーン）
                     name = os.path.splitext(file)[0]
                     self.se_keywords[name] = os.path.join(se_dir, file)
 
@@ -209,11 +188,8 @@ class TTSCog(commands.Cog):
                 return web.Response(text="Missing guild_id", status=400)
 
             guild_id = int(raw_guild_id)
-            # Bot がそのサーバーのボイスチャンネルにいるか確認
             if guild_id not in self.voice_clients:
                 return web.Response(text="Accepted but no VC connection", status=202)
-
-            # Determine the file path and log message based on content
             audio_file = None
             log_msg = "Bump notification queued"
             if "Bumpされました！" in original_message:
@@ -341,7 +317,7 @@ class TTSCog(commands.Cog):
                 current_source,
                 after=lambda e: self.bot.loop.call_soon_threadsafe(local_event.set),
             )
-        except Exception as e:
+        except (discord.ClientException, OSError) as e:
             self.logger.error(f"Failed to start playback for {audio_path}: {e}")
             return
 
@@ -353,13 +329,15 @@ class TTSCog(commands.Cog):
             if vc.is_playing():
                 try:
                     vc.stop()
-                except Exception:
-                    pass
-        except Exception as e:
+                except (discord.ClientException, OSError) as e:
+                    # pass で無視せず、デバッグ用ログとして記録しておくのが賢い選択だよ
+                    self.logger.debug(f"Failed to stop VC smoothly: {e}")
+        except Exception as e:  # noqa: BLE001
+            # 予期せぬエラーでタスク全体が死ぬのを防ぐ意図的なキャッチなので noqa を付与！
             self.logger.error(f"Unexpected error during playback wait: {e}")
         finally:
-            # 念のため、少しの猶予を置いて終了
-            await asyncio.sleep(0.01)
+                    # 念のため、少しの猶予を置いて終了
+                    await asyncio.sleep(0.01)
 
     async def _put_announcement(self, guild_id: int, text: str):
         try:
@@ -553,7 +531,6 @@ class TTSCog(commands.Cog):
 
         # 3. 再生待ちバッファ（self.play_groups）から対象データを削除する
         if guild_id in self.play_groups:
-            group_dict = self.play_groups[guild_id]
             # 管理者の場合はギルドのバッファ全体を吹き飛ばす
             if is_admin:
                 self.play_groups.pop(guild_id, None)
@@ -716,13 +693,16 @@ class TTSCog(commands.Cog):
                 return None
 
             if response.status_code == 200:
-                with open(cache_path, "wb") as f:
-                    f.write(response.content)
+                # ファイル書き込みを別スレッドで実行してイベントループを止めないようにするよ
+                await asyncio.to_thread(
+                    Path(cache_path).write_bytes, response.content
+                )
                 self.cache_manager.clean_cache()
                 return cache_path
 
             return None
-        except Exception as e:
+        # 通信エラーやファイル保存エラーなど、具体的な例外に絞ってキャッチするよ
+        except (requests.RequestException, OSError) as e:
             self.logger.error(f"Prepare audio error: {e}")
             return None
 
@@ -920,7 +900,7 @@ class TTSCog(commands.Cog):
 
         await self.bot.process_commands(message)
 
-    async def _send_and_delete_warning(self, channel: discord.TextChannel):
+    async def _send_and_delete_warning(self, channel: discord.abc.Messageable) -> None:
         """警告メッセージを送信し、10秒後に自動削除する"""
         try:
             warn_msg = await channel.send(
@@ -931,7 +911,7 @@ class TTSCog(commands.Cog):
         except discord.NotFound:
             # 10秒経つ前にユーザーがメッセージを消していた場合のクリーンアップ
             pass
-        except Exception as e:
+        except discord.HTTPException as e:
             self.logger.error(f"Failed to handle warning message: {e}")
 
     @tasks.loop(seconds=0.1)
@@ -950,13 +930,12 @@ class TTSCog(commands.Cog):
             task = asyncio.create_task(self._generation_worker(item))
             # アイテムの完了を queue.task_done() で通知するためのコールバックを登録
             task.add_done_callback(lambda t, q=self.queue: q.task_done())
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             self.logger.error(f"Generation scheduling error: {e}")
             # スケジューリング自体が失敗したら明示的に task_done() を呼ぶ
-            try:
+            # ValueError (呼び出しすぎ) が起きても安全に無視するよ
+            with suppress(ValueError):
                 self.queue.task_done()
-            except Exception:
-                pass
 
     async def _generation_worker(self, item):
         """実際の生成処理を行うワーカー（バックグラウンド実行）"""
@@ -990,8 +969,7 @@ class TTSCog(commands.Cog):
 
             # 2. テキストから生成する場合
             if content:
-                # prepare_audio は内部で Semaphore によって同時実行が制限される
-                # ここでも一定のタイムアウトを設け、失敗やタイムアウト時はスキップのためのプレースホルダを投入する
+
                 try:
                     audio_path = await asyncio.wait_for(
                         self.prepare_audio(content, author_id), timeout=40.0
@@ -1001,7 +979,7 @@ class TTSCog(commands.Cog):
                         f"Generation timeout for guild {guild_id} seq={item.get('sequence_number')}"
                     )
                     audio_path = None
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001
                     self.logger.error(
                         f"Generation error while awaiting prepare_audio: {e}"
                     )
@@ -1032,7 +1010,7 @@ class TTSCog(commands.Cog):
                         }
                     )
 
-        except Exception as e:
+        except Exception as e: # noqa: BLE001
             self.logger.error(f"Generation worker error: {e}")
 
     @tasks.loop(seconds=0.01)
@@ -1043,7 +1021,7 @@ class TTSCog(commands.Cog):
             self.play_group_counters = {}
             self.play_wait_start = {}
 
-        async def _drain_play_waiting():
+        async def _drain_play_waiting() -> None:
             try:
                 while True:
                     try:
@@ -1053,10 +1031,9 @@ class TTSCog(commands.Cog):
 
                     guild_id = item.get("guild_id")
                     if guild_id is None:
-                        try:
+                        # ValueError（呼び出しすぎ）が発生しても安全に無視するよ
+                        with suppress(ValueError):
                             self.play_waiting_queue.task_done()
-                        except Exception:
-                            pass
                         continue
 
                     group_id = item.get("group_id")
@@ -1090,11 +1067,12 @@ class TTSCog(commands.Cog):
                             group_id, None
                         )
 
-                    try:
+                    # ここも suppress で受け取れば例外ログも出ず綺麗に処理できるよ
+                    with suppress(ValueError):
                         self.play_waiting_queue.task_done()
-                    except Exception:
-                        pass
-            except Exception as e:
+
+            # 一番外側の try に対応する except はここ！
+            except Exception as e:  # noqa: BLE001
                 self.logger.debug(f"Drain error in playback: {e}")
 
         await _drain_play_waiting()
@@ -1188,7 +1166,7 @@ class TTSCog(commands.Cog):
                 if not group["items"] and not group.get("generating", False):
                     groups.pop(group_id, None)
                 return
-            except Exception as e:
+            except Exception as e: # noqa: BLE001
                 self.logger.error(
                     f"Playback error in guild {guild_id}, group {group_id}: {e}"
                 )
@@ -1209,8 +1187,6 @@ class TTSCog(commands.Cog):
 
         guild_id = guild.id
 
-        # 2. キューの存在チェック
-        queue = self.queue
         guild_id_str = str(guild_id)
         if guild_id_str in self.auto_join_configs:
             # ここでキューをチェック。なければ作る。
@@ -1233,39 +1209,37 @@ class TTSCog(commands.Cog):
                     before.channel is None
                     and after.channel is not None
                     and after.channel.id == target_vc_id
+                    and member.guild.voice_client is None
+                    and guild_id not in self.voice_clients
                 ):
-                    if (
-                        member.guild.voice_client is None
-                        and guild_id not in self.voice_clients
-                    ):
-                        voice_channel = self.bot.get_channel(target_vc_id)
-                        text_channel = self.bot.get_channel(target_tc_id)
-                        if isinstance(
-                            voice_channel, discord.VoiceChannel
-                        ) and isinstance(text_channel, discord.TextChannel):
-                            vc = await voice_channel.connect()
-                            self.voice_clients[guild_id] = vc
-                            self.text_channels[guild_id] = text_channel
-                            self.voice_channels[guild_id] = voice_channel
-                            self.is_reading[guild_id] = False
-                            if self.queue:
-                                while not self.queue.empty():
-                                    try:
-                                        self.queue.get_nowait()
-                                    except asyncio.QueueEmpty:
-                                        break
+                    voice_channel = self.bot.get_channel(target_vc_id)
+                    text_channel = self.bot.get_channel(target_tc_id)
+                    if isinstance(
+                        voice_channel, discord.VoiceChannel
+                    ) and isinstance(text_channel, discord.TextChannel):
+                        vc = await voice_channel.connect()
+                        self.voice_clients[guild_id] = vc
+                        self.text_channels[guild_id] = text_channel
+                        self.voice_channels[guild_id] = voice_channel
+                        self.is_reading[guild_id] = False
+                        if self.queue:
+                            while not self.queue.empty():
+                                try:
+                                    self.queue.get_nowait()
+                                except asyncio.QueueEmpty:
+                                    break
 
-                            if self.play_waiting_queue:
-                                while not self.play_waiting_queue.empty():
-                                    try:
-                                        self.play_waiting_queue.get_nowait()
-                                    except asyncio.QueueEmpty:
-                                        break
+                        if self.play_waiting_queue:
+                            while not self.play_waiting_queue.empty():
+                                try:
+                                    self.play_waiting_queue.get_nowait()
+                                except asyncio.QueueEmpty:
+                                    break
 
-                            await asyncio.sleep(0.5)
-                            await self._put_announcement(
-                                guild_id, "自動参加しました。読み上げを開始します。"
-                            )
+                        await asyncio.sleep(0.5)
+                        await self._put_announcement(
+                            guild_id, "自動参加しました。読み上げを開始します。"
+                        )
         except Exception:
             self.logger.exception("Auto-join handling failed")
 
@@ -1290,47 +1264,39 @@ class TTSCog(commands.Cog):
         # --- 3. アクション判定 (参加・退出・配信) ---
         action_text = ""
 
-        # 参加
-        if before.channel is None and after.channel is not None:
+        target_vc = self.voice_channels.get(guild_id)
+        
+        if target_vc:
+            # 参加
             if (
-                guild_id in self.voice_channels
-                and after.channel.id == self.voice_channels[guild_id].id
+                before.channel is None
+                and after.channel is not None
+                and after.channel.id == target_vc.id
             ):
                 action_text = "が参加しました"
-
-        # 退出 (after.channel.id ではなく before.channel.id を見ることで Noneエラーを回避)
-        elif before.channel is not None and after.channel is None:
-            if (
-                guild_id in self.voice_channels
-                and before.channel.id == self.voice_channels[guild_id].id
+        
+            # 退出
+            elif (
+                before.channel is not None
+                and after.channel is None
+                and before.channel.id == target_vc.id
             ):
                 action_text = "が退出しました"
-
-        # カメラ・配信 (after.channel が None でない場合のみ判定)
-        if not action_text and after.channel is not None:
-            if (
-                guild_id in self.voice_channels
-                and after.channel.id == self.voice_channels[guild_id].id
-            ):
-                if (
-                    getattr(before, "self_video", False) is False
-                    and getattr(after, "self_video", False) is True
-                ):
+        
+            # カメラ・配信（参加・退出以外のイベントで、対象VCにいる場合）
+            elif after.channel is not None and after.channel.id == target_vc.id:
+                b_video = getattr(before, "self_video", False)
+                a_video = getattr(after, "self_video", False)
+                b_stream = getattr(before, "self_stream", False)
+                a_stream = getattr(after, "self_stream", False)
+        
+                if not b_video and a_video:
                     action_text = "がカメラを開始しました"
-                elif (
-                    getattr(before, "self_video", False) is True
-                    and getattr(after, "self_video", False) is False
-                ):
+                elif b_video and not a_video:
                     action_text = "がカメラを終了しました"
-                elif (
-                    getattr(before, "self_stream", False) is False
-                    and getattr(after, "self_stream", False) is True
-                ):
+                elif not b_stream and a_stream:
                     action_text = "がライブ配信を開始しました"
-                elif (
-                    getattr(before, "self_stream", False) is True
-                    and getattr(after, "self_stream", False) is False
-                ):
+                elif b_stream and not a_stream:
                     action_text = "がライブ配信を終了しました"
 
         # アクションがあれば「名前＋アクション」でキューに入れる
@@ -1353,7 +1319,7 @@ class TTSCog(commands.Cog):
 
         # --- 4. 自動切断処理 ---
         # 抜けたのがBot自身である場合は、この切断判定処理を行う必要はないからリターンするよ
-        if member.id == self.bot.user.id:
+        if self.bot.user and member.id == self.bot.user.id:
             return
 
         left_channel = before.channel
@@ -1380,7 +1346,7 @@ class TTSCog(commands.Cog):
                 if vc.is_playing():
                     vc.stop()
                 await vc.disconnect(force=True)
-            except Exception as e:
+            except Exception as e: # noqa: BLE001
                 self.logger.error(f"Failed to disconnect cleanly: {e}")
 
         # 2. 状態管理フラグの初期化
@@ -1431,4 +1397,5 @@ class TTSCog(commands.Cog):
 
 
 async def setup(bot: commands.Bot):
-    await bot.add_cog(TTSCog(bot, bot.logger))
+    logger: logging.Logger = getattr(bot, "logger", logging.getLogger("bot"))
+    await bot.add_cog(TTSCog(bot, logger))
