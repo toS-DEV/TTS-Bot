@@ -6,15 +6,14 @@ import os
 from collections import OrderedDict
 from collections.abc import Callable
 from contextlib import suppress
-from pathlib import Path
 from typing import Any, TypedDict, cast
 
 import discord
 import requests
 from discord.ext import tasks
 
-import logic
-from cache_manager import VoiceCacheManager
+import utils.text_processor as logic
+from services.cache_manager import VoiceCacheManager
 
 
 class TTSQueueItem(TypedDict, total=False):
@@ -88,9 +87,9 @@ class AudioEngine:
         try:
             style_uuid, style_id = self.get_style_fn(author_id)
             cache_path = self.cache_manager.get_cache_path(text, style_uuid)
-
-            if os.path.exists(cache_path):
-                return cache_path
+                
+            if cache_path.exists():
+                return str(cache_path)
 
             request_body = {
                 "text": text,
@@ -134,11 +133,12 @@ class AudioEngine:
                 return None
 
             if response.status_code == 200:
-                await asyncio.to_thread(
-                    Path(cache_path).write_bytes, response.content
-                )
+                # 1. cache_path は既に Path なのでそのまま write_bytes を渡せるよ
+                await asyncio.to_thread(cache_path.write_bytes, response.content)
                 self.cache_manager.clean_cache()
-                return cache_path
+                
+                # 2. 関数の戻り値型 (str | None) に合わせて str にキャストして返す！
+                return str(cache_path)
 
             return None
         except (requests.RequestException, OSError) as e:
