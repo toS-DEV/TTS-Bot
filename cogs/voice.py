@@ -8,11 +8,11 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-import logic
-from dictionary_manager import DictionaryManager
-from models import Models
+import utils.text_processor as logic
+from models.voice_style import Models
 from services.audio_engine import AudioEngine
 from services.config_store import ConfigStore
+from services.dictionary_manager import DictionaryManager
 
 
 class VoiceStyle(TypedDict):
@@ -205,12 +205,16 @@ class VoiceCog(commands.Cog):
                 })
             else:
                 cache_path = self.audio_engine.cache_manager.get_cache_path(content, style_uuid)
-                if os.path.exists(cache_path):
+                # 1. os.path.exists ではなく Path オブジェクトの exists() を使う
+                if cache_path.exists():
                     await self.audio_engine.enqueue_play_waiting({
-                        "guild_id": guild_id, "group_id": group_id, "file_path": cache_path,
-                        "sequence_number": seq_idx, "total_segments": total_segments, "effects": effects,
+                        "guild_id": guild_id, 
+                        "group_id": group_id, 
+                        "file_path": str(cache_path),
+                        "sequence_number": seq_idx, 
+                        "total_segments": total_segments, 
+                        "effects": effects,
                     })
-                else:
                     await self.audio_engine.enqueue({
                         "guild_id": guild_id, "group_id": group_id, "author_id": message.author.id,
                         "content": content, "sequence_number": seq_idx, "total_segments": total_segments, "effects": effects,
