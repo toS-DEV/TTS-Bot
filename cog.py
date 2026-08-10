@@ -1,13 +1,8 @@
 import asyncio
-import io
 import json
 import logging
 import os
-import random
-import re
-import unicodedata
 from collections import OrderedDict
-from collections.abc import Callable
 from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,7 +10,6 @@ from typing import Any, TypedDict, cast
 
 import discord
 import requests
-from aiohttp import web
 from discord import app_commands
 from discord.ext import commands, tasks
 from typing_extensions import NotRequired, override
@@ -24,22 +18,9 @@ import logic
 from cache_manager import VoiceCacheManager
 from dictionary_manager import DictionaryManager
 from models import Models
-
-
-class TTSQueueItem(TypedDict):
-    guild_id: int
-    group_id: NotRequired[str]
-    author_id: NotRequired[int]
-    content: NotRequired[str]
-    file_path: NotRequired[str | None]
-    sequence_number: NotRequired[int]
-    total_segments: NotRequired[int]
-    effects: NotRequired[dict[str, bool]]
-
-
-class AutoJoinConfig(TypedDict):
-    voice_channel_id: int
-    text_channel_id: int
+from services.audio_engine import TTSQueueItem
+from services.bump_server import BumpServer
+from services.config_store import ConfigStore
 
 
 class BumpNotificationData(TypedDict):
@@ -60,7 +41,6 @@ class TTSCog(commands.Cog):
     text_channels: dict[int, discord.TextChannel]
     voice_clients: dict[int, discord.VoiceClient]
     voice_channels: dict[int, discord.VoiceChannel]
-    prefs: dict[str, dict[str, float | int | str | dict[str, object]]]
     queue: asyncio.Queue[TTSQueueItem] | None
     is_reading: dict[int, bool]
     _queue_lock: asyncio.Lock | None
@@ -71,8 +51,6 @@ class TTSCog(commands.Cog):
     play_waiting_queue: asyncio.Queue[TTSQueueItem]
     owner_id: int
     owner_display_name: str
-    config_path: str
-    auto_join_configs: dict[str, AutoJoinConfig]
     next_event: asyncio.Event | None
     api_semaphore: asyncio.Semaphore
 
@@ -85,17 +63,16 @@ class TTSCog(commands.Cog):
         self.bot = bot
         self.logger = logging.getLogger("bot.ttscog")
 
+        self.config_store = ConfigStore(logger=self.logger)
+
         self.text_channels = {}
         self.voice_clients = {}
         self.voice_channels = {}
-        self.prefs = {}
         self.is_reading = {}
         self.last_speaker_id = {}
         self.last_speak_time = {}
         self.dict_manager = DictionaryManager()
         self.cache_manager = VoiceCacheManager(max_size_mb=2048)
-        self.config_path = "auto_join_config.json"
-        self.auto_join_configs = self._load_auto_join_configs()
         self.owner_id = int(os.getenv("OWNER_ID", "0"))
         self.owner_display_name = os.getenv("OWNER_DISPLAY_NAME", "マスター")
         self.queue = asyncio.Queue()
@@ -111,60 +88,37 @@ class TTSCog(commands.Cog):
         self._update_se_keywords()
         self._http_server_task: asyncio.Task | None = None
 
-    @staticmethod
-    def _read_prefs_file(path: str) -> dict[str, Any]:
-        with open(path, "r", encoding="utf-8") as f:
-            return cast(dict[str, Any], json.load(f))
+    async def _enqueue_bump_item(self, item: TTSQueueItem) -> None:
+        """BumpServerからのアイテムを安全にキューへ追加する"""
+        if self.queue is not None:
+            await self.queue.put(item)
+        else:
+            self.logger.warning("Queue is not initialized. Dropping bump item.")
 
     @override
     async def cog_load(self) -> None:
         logger = self.logger.getChild("cog_load")
-        if os.path.isfile("prefs.json"):
-            try:
-                # 2. 呼び出すときは self._read_prefs_file にする！
-                self.prefs = await asyncio.to_thread(self._read_prefs_file, "prefs.json")
-                logger.info("Loaded preferences")
-            except Exception:
-                logger.exception("Failed to load prefs.json")
         self.queue = asyncio.Queue()
         self.play_waiting_queue = asyncio.Queue()
         self._queue_lock = asyncio.Lock()
         self.next_event = asyncio.Event()
         self.api_semaphore = asyncio.Semaphore(1)
-        self.queue = asyncio.Queue()
-        self.play_waiting_queue = asyncio.Queue()
+        
         if not self.generation_loop.is_running():
             self.generation_loop.start()
         if not self.playback_loop.is_running():
             self.playback_loop.start()
 
-        try:
-            if self._http_server_task is not None and not self._http_server_task.done():
-                logger.info("HTTP server is already running. Skipping duplicate startup.")
-            else:
-                self._http_server_task = asyncio.create_task(self.start_http_server())
-                logger.info("Started HTTP server task for bump notifications")
-        except Exception:
-            logger.exception("Failed to start HTTP server task")
+        self.bump_server = BumpServer(
+            bot=self.bot,
+            enqueue_func=self._enqueue_bump_item,
+            is_vc_connected_func=lambda guild_id: guild_id in self.voice_clients,
+            port=50030,
+        )
+        await self.bump_server.start()
 
         logger.info("Initialized TTSCog successfully")
 
-    async def start_http_server(self):
-        """Start aiohttp web server to receive external bump notifications."""
-        try:
-            app = web.Application()
-            app.add_routes(
-                [web.post("/bot_tts_gttegldxdzmyrohd", self.handle_bump_notification)]
-            )
-            runner = web.AppRunner(app)
-            await runner.setup()
-            site = web.TCPSite(runner, "0.0.0.0", 50030)
-            await site.start()
-            self.logger.info(
-                "📢 Web server for bump notifications listening on port 50030"
-            )
-        except Exception:
-            self.logger.exception("Failed to start HTTP server")
 
     def _update_se_keywords(self):
         """ディレクトリをスキャンして {ファイル名: フルパス} の辞書を作る"""
@@ -175,117 +129,6 @@ class TTSCog(commands.Cog):
                 if file.endswith((".wav", ".mp3")):
                     name = os.path.splitext(file)[0]
                     self.se_keywords[name] = os.path.join(se_dir, file)
-
-    async def handle_bump_notification(self, request: web.Request) -> web.Response:
-        """Handle POST requests from external services (e.g., Node.js)."""
-        try:
-            body = await request.json()
-            data = cast(BumpNotificationData, body)
-            raw_guild_id = data.get("guild_id")
-            original_message = data.get("message") or ""
-
-            if raw_guild_id is None:
-                self.logger.warning("guild_id is missing in request")
-                return web.Response(text="Missing guild_id", status=400)
-
-            guild_id = int(raw_guild_id)
-            if guild_id not in self.voice_clients:
-                return web.Response(text="Accepted but no VC connection", status=202)
-            audio_file = None
-            log_msg = "Bump notification queued"
-            if "Bumpされました！" in original_message:
-                audio_file = self._pick_random_file("Extra/SuccessBump")
-                log_msg = f"Success Bump sound selected: {audio_file}"
-            elif "Bumpできます！" in original_message:
-                audio_file = self._pick_random_file("Extra/PleaseBump")
-                log_msg = f"Please Bump sound selected: {audio_file}"
-
-            guild = self.bot.get_guild(guild_id)
-            if guild is None:
-                self.logger.warning(f"Guild {guild_id} not found.")
-                return web.Response(text="Guild not found", status=404)
-
-            bot_member = guild.me
-            queue_item: TTSQueueItem = {
-                "guild_id": guild_id,
-                "author_id": bot_member.id,
-                "content": original_message,
-                "file_path": audio_file,
-                # bump は単一セグメント扱い
-                "sequence_number": 0,
-                "total_segments": 1,
-            }
-
-            if self.queue:
-                await self.queue.put(queue_item)
-                self.logger.info(f"✅ {log_msg}")
-                return web.Response(text="Success", status=200)
-
-            return web.Response(text="Queue not found", status=500)
-
-        except Exception as e:
-            self.logger.exception("❌ Error processing Bump notification")
-            return web.Response(text=str(e), status=500)
-
-    def _load_auto_join_configs(self) -> dict[str, AutoJoinConfig]:  # 戻り値を明示
-        if not os.path.exists(self.config_path):
-            return {}
-        with open(self.config_path, "r") as f:
-            # json.load の結果を AutoJoinConfig の辞書としてキャスト
-            return cast(dict[str, AutoJoinConfig], json.load(f))
-
-    def _save_auto_join_configs(self):
-        try:
-            with open(self.config_path, "w") as f:
-                json.dump(self.auto_join_configs, f, indent=2)
-        except Exception:
-            self.logger.exception("Failed to save auto-join configs")
-
-    def _pick_random_file(self, base_path: str) -> str | None:
-        """
-        ディレクトリ名の数値に基づき、再帰的にファイルを抽選する。
-        - フォルダ名に数値がある場合（例: '60'）: その数値を重みにする。
-        - 数値がない、またはファイルの場合: 重みを 10 として扱う。
-        """
-        if not os.path.exists(base_path):
-            return None
-
-        # ファイルに到達したらそのパスを返す
-        if os.path.isfile(base_path):
-            return base_path
-
-        items = os.listdir(base_path)
-        if not items:
-            return None
-
-        candidates: list[str] = []
-        weights: list[int] = []
-
-        for item in items:
-            full_path = os.path.join(base_path, item)
-
-            # 1. フォルダ名/ファイル名から数値を抽出
-            # フォルダ名自体が数字（例: '60'）または 'Name_60' のような形式に対応
-            match = re.search(r"(\d+)", item)
-
-            if match:
-                weight = int(match.group(1))
-            else:
-                # 混合している場合や数値がない場合は 10
-                weight = 10
-
-            candidates.append(full_path)
-            weights.append(weight)
-
-        # 重み付き抽選
-        chosen = random.choices(candidates, weights=weights, k=1)[0]
-
-        # 抽選された先がディレクトリならさらに深く潜る
-        if os.path.isdir(chosen):
-            return self._pick_random_file(chosen)
-
-        # ファイルなら確定
-        return chosen
 
     async def _play_audio_and_wait(
         self,
@@ -352,15 +195,17 @@ class TTSCog(commands.Cog):
             if guild is None:
                 self.logger.warning(f"Guild {guild_id} not found for announcement")
                 return
-            bot_member = guild.me
-            data: TTSQueueItem = {
-                "guild_id": guild_id,
-                "author_id": bot_member.id,
-                "content": text,
-                # アナウンスは単一セグメント扱い
-                "sequence_number": 0,
-                "total_segments": 1,
-            }
+            data = cast(
+                    TTSQueueItem,
+                    {
+                        "guild_id": guild_id,
+                        "author_id": guild.me.id,
+                        "content": text,
+                        # アナウンスは単一セグメント扱い
+                        "sequence_number": 0,
+                        "total_segments": 1,
+                    },
+                )
             if self.queue:
                 await self.queue.put(data)
         except Exception:
@@ -368,37 +213,8 @@ class TTSCog(commands.Cog):
 
     def on_close(self) -> None:
         logger = self.logger.getChild("on_close")
-        try:
-            with open("prefs.json", "w") as f:
-                f.write(json.dumps(self.prefs))
-        except Exception:
-            logger.exception("Failed to save prefs on close")
+        self.config_store.save_prefs()
         logger.info("TTSCog Closed")
-
-    def get_pref(
-        self,
-        user_id: int,
-        key: str,
-        def_val: object,
-        cond: Callable[[object], bool],
-    ) -> object:
-        user_id_str = str(user_id)
-
-        if user_id_str not in self.prefs:
-            self.prefs[user_id_str] = {}
-        user_prefs = self.prefs[user_id_str]
-
-        if key in user_prefs:
-            value = user_prefs[key]
-            if cond(value):
-                return value
-
-        if isinstance(def_val, (float, int, str, dict)):
-            user_prefs[key] = cast(float | int | str | dict[str, object], def_val)
-        else:
-            user_prefs[key] = str(def_val)
-
-        return def_val
 
     def get_style(self, user_id: int) -> tuple[str, int]:
         # モデルのデフォルト値（最初のモデルの最初のスタイル）を取得
@@ -409,8 +225,8 @@ class TTSCog(commands.Cog):
             "style_id": default_style_id,
         }
 
-        # get_prefを使って設定を取得/保存。設定が新しい辞書形式かチェックする。
-        style_pref = self.get_pref(
+
+        style_pref = self.config_store.get_pref(
             user_id=user_id,
             key="style",
             def_val=def_val,
@@ -476,14 +292,17 @@ class TTSCog(commands.Cog):
         # 7. 読み上げ用データの作成と投入
         announcement_text = f"【{channel.name}】に参加しました。"
 
-        join_data: TTSQueueItem = {
-            "guild_id": guild_id,
-            "author_id": guild.me.id,
-            "content": announcement_text,
-            # 参加通知も単一セグメント
-            "sequence_number": 0,
-            "total_segments": 1,
-        }
+        join_data= cast(
+            TTSQueueItem,
+            {
+                "guild_id": guild_id,
+                "author_id": guild.me.id,
+                "content": announcement_text,
+                # 参加通知も単一セグメント
+                "sequence_number": 0,
+                "total_segments": 1,
+            }
+        )
 
         if self.queue is not None:
             await self.queue.put(join_data)
@@ -570,13 +389,16 @@ class TTSCog(commands.Cog):
             announcement_text = "読み上げを終わります"
 
             # 1. 読み上げキューに追加
-            leave_data: TTSQueueItem = {
-                "guild_id": guild_id,
-                "author_id": bot_member.id,
-                "content": announcement_text,
-                "sequence_number": 0,
-                "total_segments": 1,
-            }
+            leave_data= cast(
+            TTSQueueItem,
+                {
+                    "guild_id": guild_id,
+                    "author_id": bot_member.id,
+                    "content": announcement_text,
+                    "sequence_number": 0,
+                    "total_segments": 1,
+                }
+            )
 
             if self.queue is not None:
                 await self.queue.put(leave_data)
@@ -632,13 +454,9 @@ class TTSCog(commands.Cog):
             )
             return
 
-        # 保存
-        guild_key = str(guild.id)
-        self.auto_join_configs[guild_key] = {
-            "voice_channel_id": voice_channel.id,
-            "text_channel_id": text_channel.id,
-        }
-        self._save_auto_join_configs()
+        self.config_store.set_auto_join_config(
+            guild.id, voice_channel.id, text_channel.id
+        )
 
         await interaction.response.send_message(
             f"自動参加設定を保存しました。ボイス: {voice_channel.name}, テキスト: {text_channel.name}"
@@ -712,69 +530,6 @@ class TTSCog(commands.Cog):
         except (requests.RequestException, OSError) as e:
             self.logger.error(f"Prepare audio error: {e}")
             return None
-
-    async def set_pref(
-        self, interaction: discord.Interaction, key: str, value: Any, message: str
-    ):
-        user_id_str = str(interaction.user.id)
-        if user_id_str not in self.prefs or type(self.prefs[user_id_str]) != dict:
-            self.prefs[user_id_str] = {}
-        self.prefs[user_id_str][key] = value
-        await interaction.response.send_message(message)
-
-    @app_commands.command(
-        name="add_word", description="カスタム辞書に単語の読み方を追加/更新します。"
-    )
-    @app_commands.describe(word="元の単語 (例: Wamom)", reading="読み方 (例: わもむ)")
-    async def add_word(self, interaction: discord.Interaction, word: str, reading: str):
-        # 1. 全角を半角に正規化 (NFKC) し、2. 小文字に変換
-        processed_word = unicodedata.normalize("NFKC", word).lower()
-
-        self.dict_manager.add_word(processed_word, reading)
-        await interaction.response.send_message(
-            f"✅ カスタム辞書に単語 **`{processed_word}`** を読み方 **`{reading}`** で登録しました。\n"
-            f"（元の入力: `{word}` を自動変換しました）"
-        )
-
-    @app_commands.command(
-        name="del_word", description="カスタム辞書から単語を削除します。"
-    )
-    @app_commands.describe(word="削除したい元の単語")
-    async def del_word(self, interaction: discord.Interaction, word: str):
-        # 登録時と同様に正規化して小文字化
-        processed_word = unicodedata.normalize("NFKC", word).lower()
-
-        if self.dict_manager.delete_word(processed_word):
-            await interaction.response.send_message(
-                f"✅ カスタム辞書から単語 **`{processed_word}`** を削除しました。"
-            )
-        else:
-            await interaction.response.send_message(
-                f"❌ 単語 **`{processed_word}`** は辞書に見つかりませんでした。",
-                ephemeral=True,
-            )
-
-    @app_commands.command(
-        name="export_dict",
-        description="現在のカスタム辞書をCSVファイルとしてダウンロードします。",
-    )
-    async def export_dict(self, interaction: discord.Interaction):
-        csv_content = self.dict_manager.export_to_csv()
-
-        if csv_content is None:
-            await interaction.response.send_message("辞書が空です。", ephemeral=True)
-            return
-
-        # CSV文字列をファイルオブジェクトとしてラップ
-        csv_file = discord.File(
-            fp=io.BytesIO(csv_content.encode("utf-8")),
-            filename="custom_dict.csv",
-            description="TTS Custom Dictionary",
-        )
-
-        await interaction.response.send_message(
-            "✅ カスタム辞書をCSVとしてエクスポートします。", file=csv_file
-        )
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
@@ -866,14 +621,17 @@ class TTSCog(commands.Cog):
             se_path = self.se_keywords.get(content)
             if se_path:
                 await self.play_waiting_queue.put(
-                    {
-                        "guild_id": guild_id,
-                        "group_id": group_id,
-                        "file_path": se_path,
-                        "sequence_number": seq_idx,
-                        "total_segments": total_segments,
-                        "effects": effects,
-                    }
+                    cast(
+                        TTSQueueItem,
+                        {
+                            "guild_id": guild_id,
+                            "group_id": group_id,
+                            "file_path": se_path,
+                            "sequence_number": seq_idx,
+                            "total_segments": total_segments,
+                            "effects": effects,
+                        }
+                    )
                 )
                 continue
 
@@ -881,28 +639,34 @@ class TTSCog(commands.Cog):
             cache_path = self.cache_manager.get_cache_path(content, style_uuid)
             if os.path.exists(cache_path):
                 await self.play_waiting_queue.put(
-                    {
-                        "guild_id": guild_id,
-                        "group_id": group_id,
-                        "file_path": cache_path,
-                        "sequence_number": seq_idx,
-                        "total_segments": total_segments,
-                        "effects": effects,
-                    }
-                )
+                    cast(
+                            TTSQueueItem,
+                            {
+                                "guild_id": guild_id,
+                                "group_id": group_id,
+                                "file_path": cache_path,
+                                "sequence_number": seq_idx,
+                                "total_segments": total_segments,
+                                "effects": effects,
+                            }
+                        )
+                    )
             else:
                 # 生成が必要な場合
                 await self.queue.put(
-                    {
-                        "guild_id": guild_id,
-                        "group_id": group_id,
-                        "author_id": message.author.id,
-                        "content": content,
-                        "sequence_number": seq_idx,
-                        "total_segments": total_segments,
-                        "effects": effects,
-                    }
-                )
+                    cast(
+                            TTSQueueItem,
+                            {
+                                "guild_id": guild_id,
+                                "group_id": group_id,
+                                "author_id": message.author.id,
+                                "content": content,
+                                "sequence_number": seq_idx,
+                                "total_segments": total_segments,
+                                "effects": effects,
+                            }
+                        )
+                    )  
 
         # 履歴を更新
         self.last_speaker_id[guild_id] = message.author.id
@@ -968,14 +732,17 @@ class TTSCog(commands.Cog):
                 seq = item.get("sequence_number", 0)
                 total = item.get("total_segments", 1)
                 await self.play_waiting_queue.put(
-                    {
-                        "guild_id": guild_id,
-                        "group_id": group_id,
-                        "file_path": custom_file,
-                        "sequence_number": seq,
-                        "total_segments": total,
-                        "effects": effects,
-                    }
+                    cast(
+                        TTSQueueItem,
+                        {
+                            "guild_id": guild_id,
+                            "group_id": group_id,
+                            "file_path": custom_file,
+                            "sequence_number": seq,
+                            "total_segments": total,
+                            "effects": effects,
+                        }
+                    )
                 )
                 return
 
@@ -1002,26 +769,32 @@ class TTSCog(commands.Cog):
 
                 if audio_path:
                     await self.play_waiting_queue.put(
-                        {
-                            "guild_id": guild_id,
-                            "group_id": group_id,
-                            "file_path": audio_path,
-                            "sequence_number": seq,
-                            "total_segments": total,
-                            "effects": effects,
-                        }
+                        cast(
+                            TTSQueueItem,
+                            {
+                                "guild_id": guild_id,
+                                "group_id": group_id,
+                                "file_path": audio_path,
+                                "sequence_number": seq,
+                                "total_segments": total,
+                                "effects": effects,
+                            }
+                        )
                     )
                 else:
                     # 生成失敗またはタイムアウト: 永久待ちにならないように「スキップ」を示すエントリを投入する
                     await self.play_waiting_queue.put(
-                        {
-                            "guild_id": guild_id,
-                            "group_id": group_id,
-                            "file_path": None,
-                            "sequence_number": seq,
-                            "total_segments": total,
-                            "effects": effects,
-                        }
+                        cast(
+                            TTSQueueItem,
+                            {
+                                "guild_id": guild_id,
+                                "group_id": group_id,
+                                "file_path": None,
+                                "sequence_number": seq,
+                                "total_segments": total,
+                                "effects": effects,
+                            }
+                        )
                     )
 
         except Exception as e: # noqa: BLE001
@@ -1194,28 +967,21 @@ class TTSCog(commands.Cog):
         before: discord.VoiceState,
         after: discord.VoiceState,
     ):
-        # 1. Guildの存在チェック
         guild = member.guild
         if guild is None:
             return
 
         guild_id = guild.id
 
-        guild_id_str = str(guild_id)
-        if guild_id_str in self.auto_join_configs:
-            # ここでキューをチェック。なければ作る。
-            if self.queue is None:
-                self.queue = asyncio.Queue()
-            if self.play_waiting_queue is None:
-                self.play_waiting_queue = asyncio.Queue()
-
-            config = self.auto_join_configs[guild_id_str]
-
         # --- 1. Auto-join ロジック ---
         try:
-            guild_id_str = str(guild_id)
-            if guild_id_str in self.auto_join_configs:
-                config = self.auto_join_configs[guild_id_str]
+            config = self.config_store.get_auto_join_config(guild_id)
+            if config is not None:
+                if self.queue is None:
+                    self.queue = asyncio.Queue()
+                if self.play_waiting_queue is None:
+                    self.play_waiting_queue = asyncio.Queue()
+
                 target_vc_id = config.get("voice_channel_id")
                 target_tc_id = config.get("text_channel_id")
 
@@ -1257,7 +1023,6 @@ class TTSCog(commands.Cog):
         except Exception:
             self.logger.exception("Auto-join handling failed")
 
-        # Botが参加していないなら終了
         if guild_id not in self.voice_clients:
             return
 
@@ -1317,15 +1082,16 @@ class TTSCog(commands.Cog):
         if action_text:
             if self.queue is not None:
                 await self.queue.put(
-                    {
-                        "guild_id": guild_id,
-                        "author_id": member.id,
-                        "content": f"{name_to_read}{action_text}",
-                        # イベント通知は単一セグメント
-                        "sequence_number": 0,
-                        "total_segments": 1,
-                    }
-                )
+                    cast(
+                        TTSQueueItem,
+                        {
+                            "guild_id": guild_id,
+                            "author_id": member.id,
+                            "content": f"{name_to_read}{action_text}",
+                            "sequence_number": 0,
+                            "total_segments": 1,
+                        }
+                    ))
             else:
                 self.logger.warning(
                     "Queue is not initialized. Skipping action notification."
