@@ -34,6 +34,7 @@ class TTSQueueItem(TypedDict):
     file_path: NotRequired[str | None]
     sequence_number: NotRequired[int]
     total_segments: NotRequired[int]
+    effects: NotRequired[dict[str, bool]]
 
 
 class AutoJoinConfig(TypedDict):
@@ -114,7 +115,7 @@ class TTSCog(commands.Cog):
     def _read_prefs_file(path: str) -> dict[str, Any]:
         with open(path, "r", encoding="utf-8") as f:
             return cast(dict[str, Any], json.load(f))
-    
+
     @override
     async def cog_load(self) -> None:
         logger = self.logger.getChild("cog_load")
@@ -145,7 +146,7 @@ class TTSCog(commands.Cog):
                 logger.info("Started HTTP server task for bump notifications")
         except Exception:
             logger.exception("Failed to start HTTP server task")
-            
+
         logger.info("Initialized TTSCog successfully")
 
     async def start_http_server(self):
@@ -292,6 +293,7 @@ class TTSCog(commands.Cog):
         audio_path: str,
         next_audio_path: str | None = None,
         playback_timeout: float = 30.0,
+        effects: dict[str, bool] | None = None,
     ) -> None:
         """再生して終了まで待機する。"""
         if not vc or not vc.is_connected():
@@ -303,7 +305,12 @@ class TTSCog(commands.Cog):
 
         # 共有の self.next_event ではなく、この再生回限りのイベントを作成して競合を防ぐ
         local_event = asyncio.Event()
+
+        ffmpeg_filters = logic.build_ffmpeg_options(effects)
+
         ffmpeg_options = "-loglevel panic"
+        if ffmpeg_filters:
+            ffmpeg_options += f" {ffmpeg_filters}"
 
         try:
             current_source = discord.FFmpegPCMAudio(
@@ -829,7 +836,7 @@ class TTSCog(commands.Cog):
             segments.append(name)
 
         # 2. 本文の追加
-        processed_text = logic.process_text(
+        processed_text, effects = logic.process_text(
             message.content, message.guild, self.dict_manager, self.bot
         )
         non_empty_body = [s for s in logic.split_text(processed_text) if s.strip()]
@@ -865,6 +872,7 @@ class TTSCog(commands.Cog):
                         "file_path": se_path,
                         "sequence_number": seq_idx,
                         "total_segments": total_segments,
+                        "effects": effects,
                     }
                 )
                 continue
@@ -879,6 +887,7 @@ class TTSCog(commands.Cog):
                         "file_path": cache_path,
                         "sequence_number": seq_idx,
                         "total_segments": total_segments,
+                        "effects": effects,
                     }
                 )
             else:
@@ -891,6 +900,7 @@ class TTSCog(commands.Cog):
                         "content": content,
                         "sequence_number": seq_idx,
                         "total_segments": total_segments,
+                        "effects": effects,
                     }
                 )
 
@@ -943,6 +953,7 @@ class TTSCog(commands.Cog):
         author_id = item.get("author_id")
         content = item.get("content")
         custom_file = item.get("file_path")
+        effects = item.get("effects")
 
         # Ensure a group_id is present (propagate from incoming item or generate a legacy one)
         group_id = item.get("group_id")
@@ -963,6 +974,7 @@ class TTSCog(commands.Cog):
                         "file_path": custom_file,
                         "sequence_number": seq,
                         "total_segments": total,
+                        "effects": effects,
                     }
                 )
                 return
@@ -996,6 +1008,7 @@ class TTSCog(commands.Cog):
                             "file_path": audio_path,
                             "sequence_number": seq,
                             "total_segments": total,
+                            "effects": effects,
                         }
                     )
                 else:
@@ -1007,6 +1020,7 @@ class TTSCog(commands.Cog):
                             "file_path": None,
                             "sequence_number": seq,
                             "total_segments": total,
+                            "effects": effects,
                         }
                     )
 
@@ -1152,7 +1166,7 @@ class TTSCog(commands.Cog):
                     next_path = next_item.get("file_path")
 
                 await self._play_audio_and_wait(
-                    vc, audio_path, next_audio_path=next_path
+                    vc, audio_path, next_audio_path=next_path, effects=item.get("effects"),
                 )
 
                 group["next_index"] = expected_idx + 1
@@ -1265,7 +1279,7 @@ class TTSCog(commands.Cog):
         action_text = ""
 
         target_vc = self.voice_channels.get(guild_id)
-        
+
         if target_vc:
             # 参加
             if (
@@ -1274,7 +1288,7 @@ class TTSCog(commands.Cog):
                 and after.channel.id == target_vc.id
             ):
                 action_text = "が参加しました"
-        
+
             # 退出
             elif (
                 before.channel is not None
@@ -1282,14 +1296,14 @@ class TTSCog(commands.Cog):
                 and before.channel.id == target_vc.id
             ):
                 action_text = "が退出しました"
-        
+
             # カメラ・配信（参加・退出以外のイベントで、対象VCにいる場合）
             elif after.channel is not None and after.channel.id == target_vc.id:
                 b_video = getattr(before, "self_video", False)
                 a_video = getattr(after, "self_video", False)
                 b_stream = getattr(before, "self_stream", False)
                 a_stream = getattr(after, "self_stream", False)
-        
+
                 if not b_video and a_video:
                     action_text = "がカメラを開始しました"
                 elif b_video and not a_video:
