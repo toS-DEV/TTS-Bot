@@ -1,6 +1,9 @@
+import json
 import os
 import re
+import subprocess
 import unicodedata
+import wave
 from typing import Protocol, runtime_checkable
 
 import alkana
@@ -77,6 +80,71 @@ def split_text(text: str) -> list[str]:
 
     return processed
 
+def extract_line_effects(line: str) -> tuple[str, dict[str, bool]]:
+    """行頭のMarkdown記法（#, ##, ###, -#, >）を検出・除去し、エフェクトフラグを返す"""
+    effects = {
+        "header_1": False,
+        "header_2": False,
+        "header_3": False,
+        "subtext": False,
+        "quote": False,
+    }
+    line = line.strip()
+
+    if re.match(r"^###\s+", line):
+        effects["header_3"] = True
+        line = re.sub(r"^###\s+", "", line)
+    elif re.match(r"^##\s+", line):
+        effects["header_2"] = True
+        line = re.sub(r"^##\s+", "", line)
+    elif re.match(r"^#\s+", line):
+        effects["header_1"] = True
+        line = re.sub(r"^#\s+", "", line)
+
+    if re.match(r"^-#\s+", line):
+        effects["subtext"] = True
+        line = re.sub(r"^-#\s+", "", line)
+
+    if re.match(r"^>\s+", line):
+        effects["quote"] = True
+        line = re.sub(r"^>\s+", "", line)
+
+    return line, effects
+
+def extract_inline_effects(text: str) -> tuple[str, dict[str, bool]]:
+    """インラインのMarkdown記法（**, *, ~~, ||, `）を検出・除去し、エフェクトフラグを返す"""
+    effects = {
+        "loud": False,
+        "fast": False,
+        "low": False,
+        "spoiler": False,
+        "code": False,
+    }
+
+    if not text:
+        return "", effects
+
+    if re.search(r"\*\*.*?\*\*", text):
+        effects["loud"] = True
+        text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
+
+    if re.search(r"(\*|_).*?(\*|_)", text):
+        effects["fast"] = True
+        text = re.sub(r"(\*|_)(.*?)\1", r"\2", text)
+
+    if re.search(r"~~.*?~~", text):
+        effects["low"] = True
+        text = re.sub(r"~~(.*?)~~", r"\1", text)
+
+    if re.search(r"\|\|.*?\|\|", text):
+        effects["spoiler"] = True
+        text = re.sub(r"\|\|(.*?)\|\|", r"\1", text)
+
+    if re.search(r"`.*?`", text):
+        effects["code"] = True
+        text = re.sub(r"`(.*?)`", r"\1", text)
+
+    return text, effects
 
 def extract_markdown_effects(text: str) -> tuple[str, dict[str, bool]]:
     """Markdown記法を検出し、エフェクトフラグと記号除去後のテキストを返す"""
@@ -138,54 +206,52 @@ def extract_markdown_effects(text: str) -> tuple[str, dict[str, bool]]:
 
     return text, effects
 
-
 def process_text(
     text: str,
     guild: discord.Guild | None,
     dict_manager: DictManager | object,
     bot: discord.Client,
-) -> tuple[str, dict[str, bool]]:
+) -> str:  # ← 戻り値を str に変更するよ
     """読み上げ用テキストの整形・変換メイン処理"""
     if not text:
-        return "", {}
+        return ""
 
-    text, effects = extract_markdown_effects(text)
-    
     # 1. メンション置換
     text = _replace_mentions(text, guild, bot)
 
     # 2. 正規化 / 小文字化
     text = unicodedata.normalize("NFKC", text).lower()
+
+    # 3. 改行を句点にして分割しやすくする
     text = text.replace("\r\n", "。").replace("\n", "。")
 
-    # 3. URL・記号置換
+    # 4. URL・記号置換
     text = apply_basic_replacements(text)
 
-    # 4. カスタム絵文字置換
+    # 5. カスタム絵文字置換
     text = _replace_custom_emojis(text)
 
-    # 5. Unicode絵文字の日本語化
+    # 6. Unicode絵文字の日本語化
     text = _apply_emoji_reading(text)
 
-    # 6. 連続単語の集約
+    # 7. 連続単語の集約
     text = _summarize_continuous_words(text)
 
-    # 7. カスタム辞書適用
+    # 8. カスタム辞書適用
     if isinstance(dict_manager, DictManager):
         custom_dict = dict_manager.get_all()
         for word, reading in custom_dict.items():
             text = text.replace(word, reading)
 
-    # 8. 英語音訳 (alkana)
+    # 9. 英語音訳 (alkana)
     text = _apply_alkana(text)
 
-    # 9. 記号統一・キャッシュ共通化処理
+    # 10. 記号統一処理
     text = text.replace("!", "。").replace("！", "。").replace(".", "。")
     text = text.replace("?", "？")
     text = re.sub(r"。{2,}", "。", text)
-    text = text.strip()
 
-    return text, effects
+    return text.strip()
 
 
 def process_name(name: str, dict_manager: DictManager | object) -> str:
@@ -330,11 +396,50 @@ def _apply_alkana(text: str) -> str:
                 processed += segment
     return processed
 
+def get_sample_rate(file_path: str) -> int:
+    """音声ファイルから動的にサンプリングレート(Hz)を取得する"""
+    if not file_path or not os.path.exists(file_path):
+        return 48000  # デフォルト値
 
-def build_ffmpeg_options(effects: dict[str, bool] | None) -> str:
-    """エフェクト情報から FFmpeg の -af オプション文字列を生成"""
+    try:
+        # VOICEVOXなどの生成ファイル(WAV)なら標準ライブラリで取得
+        if file_path.endswith(".wav"):
+            with wave.open(file_path, "rb") as wf:
+                return wf.getframerate()
+
+        # MP3などの場合は ffprobe を使って取得
+        cmd = [
+            "ffprobe",
+            "-v", "error",
+            "-select_streams", "a:0",
+            "-show_entries", "stream=sample_rate",
+            "-of", "json",
+            file_path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        data = json.loads(result.stdout)
+        return int(data["streams"][0]["sample_rate"])
+
+    # 想定される具体的な例外のみをキャッチする
+    except (
+        wave.Error,
+        subprocess.SubprocessError,
+        json.JSONDecodeError,
+        KeyError,
+        IndexError,
+        ValueError,
+        OSError,
+    ):
+        return 48000
+
+
+def build_ffmpeg_options(effects: dict[str, bool] | None, file_path: str | None = None) -> str:
+    """エフェクト情報から FFmpeg の -af オプション文字列を動的に生成"""
     if not effects:
         return ""
+
+    # ★ 音声ファイルから元のサンプリングレートを動的に取得！
+    sample_rate = get_sample_rate(file_path) if file_path else 48000
 
     filters = []
 
@@ -346,7 +451,9 @@ def build_ffmpeg_options(effects: dict[str, bool] | None) -> str:
     elif effects.get("header_2"):
         filters.append("volume=1.4")
     elif effects.get("header_3"):
-        filters.append("asetrate=24000*1.08,aresample=24000")
+        # 元のサンプリングレートの 1.2倍（高音化）を動的計算！
+        target_rate = int(sample_rate * 1.2)
+        filters.append(f"asetrate={target_rate},aresample={sample_rate}")
 
     if effects.get("subtext"):
         filters.append("volume=0.6,lowpass=f=1500")
@@ -361,7 +468,9 @@ def build_ffmpeg_options(effects: dict[str, bool] | None) -> str:
         filters.append("atempo=1.25")
 
     if effects.get("low"):
-        filters.append("asetrate=24000*0.85,aresample=24000")
+        # 元のサンプリングレートの 0.85倍（低音化）を動的計算！
+        target_rate = int(sample_rate * 0.85)
+        filters.append(f"asetrate={target_rate},aresample={sample_rate}")
 
     if effects.get("code"):
         filters.append("flanger=delay=2:depth=5")
