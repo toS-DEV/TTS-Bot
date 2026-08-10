@@ -3,6 +3,7 @@ import json
 import logging
 import os
 from collections import OrderedDict
+from collections.abc import Callable
 from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,7 +37,6 @@ class VoiceStyle(TypedDict):
 class TTSCog(commands.Cog):
     bot: commands.Bot
     logger: logging.Logger
-
 
     text_channels: dict[int, discord.TextChannel]
     voice_clients: dict[int, discord.VoiceClient]
@@ -103,7 +103,6 @@ class TTSCog(commands.Cog):
         self._queue_lock = asyncio.Lock()
         self.next_event = asyncio.Event()
         self.api_semaphore = asyncio.Semaphore(1)
-        
         if not self.generation_loop.is_running():
             self.generation_loop.start()
         if not self.playback_loop.is_running():
@@ -118,7 +117,6 @@ class TTSCog(commands.Cog):
         await self.bump_server.start()
 
         logger.info("Initialized TTSCog successfully")
-
 
     def _update_se_keywords(self):
         """ディレクトリをスキャンして {ファイル名: フルパス} の辞書を作る"""
@@ -146,7 +144,6 @@ class TTSCog(commands.Cog):
             self.logger.warning(f"Audio path is invalid or missing: {audio_path}")
             return
 
-        # 共有の self.next_event ではなく、この再生回限りのイベントを作成して競合を防ぐ
         local_event = asyncio.Event()
 
         ffmpeg_filters = logic.build_ffmpeg_options(effects)
@@ -162,7 +159,6 @@ class TTSCog(commands.Cog):
                 options=ffmpeg_options,
             )
 
-            # 再生開始
             vc.play(
                 current_source,
                 after=lambda e: self.bot.loop.call_soon_threadsafe(local_event.set),
@@ -171,7 +167,6 @@ class TTSCog(commands.Cog):
             self.logger.error(f"Failed to start playback for {audio_path}: {e}")
             return
 
-        # 再生終了を待機
         try:
             await asyncio.wait_for(local_event.wait(), timeout=playback_timeout)
         except asyncio.TimeoutError:
@@ -180,14 +175,11 @@ class TTSCog(commands.Cog):
                 try:
                     vc.stop()
                 except (discord.ClientException, OSError) as e:
-                    # pass で無視せず、デバッグ用ログとして記録しておくのが賢い選択だよ
                     self.logger.debug(f"Failed to stop VC smoothly: {e}")
         except Exception as e:  # noqa: BLE001
-            # 予期せぬエラーでタスク全体が死ぬのを防ぐ意図的なキャッチなので noqa を付与！
             self.logger.error(f"Unexpected error during playback wait: {e}")
         finally:
-                    # 念のため、少しの猶予を置いて終了
-                    await asyncio.sleep(0.01)
+            await asyncio.sleep(0.01)
 
     async def _put_announcement(self, guild_id: int, text: str):
         try:
@@ -196,16 +188,15 @@ class TTSCog(commands.Cog):
                 self.logger.warning(f"Guild {guild_id} not found for announcement")
                 return
             data = cast(
-                    TTSQueueItem,
-                    {
-                        "guild_id": guild_id,
-                        "author_id": guild.me.id,
-                        "content": text,
-                        # アナウンスは単一セグメント扱い
-                        "sequence_number": 0,
-                        "total_segments": 1,
-                    },
-                )
+                TTSQueueItem,
+                {
+                    "guild_id": guild_id,
+                    "author_id": guild.me.id,
+                    "content": text,
+                    "sequence_number": 0,
+                    "total_segments": 1,
+                },
+            )
             if self.queue:
                 await self.queue.put(data)
         except Exception:
@@ -216,17 +207,29 @@ class TTSCog(commands.Cog):
         self.config_store.save_prefs()
         logger.info("TTSCog Closed")
 
+    def get_pref(
+        self,
+        user_id: int,
+        key: str,
+        def_val: object,
+        cond: Callable[[object], bool],
+    ) -> object:
+        return self.config_store.get_pref(user_id, key, def_val, cond)
+
+    async def set_pref(
+        self, interaction: discord.Interaction, key: str, value: Any, message: str
+    ):
+        self.config_store.set_pref(interaction.user.id, key, value)
+        await interaction.response.send_message(message)
+
     def get_style(self, user_id: int) -> tuple[str, int]:
-        # モデルのデフォルト値（最初のモデルの最初のスタイル）を取得
-        # ※ models.py に Models.get_default_style() が実装されている前提
         default_uuid, default_style_id = Models.get_default_style()
         def_val: dict[str, str | int] = {
             "uuid": default_uuid,
             "style_id": default_style_id,
         }
 
-
-        style_pref = self.config_store.get_pref(
+        style_pref = self.get_pref(
             user_id=user_id,
             key="style",
             def_val=def_val,
@@ -239,7 +242,6 @@ class TTSCog(commands.Cog):
     @app_commands.command(name="join", description="ボイスチャンネルに参加します。")
     async def join(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer()
-        # 1. Guild と Member の存在保証
         guild = interaction.guild
         if guild is None or not isinstance(interaction.user, discord.Member):
             await interaction.followup.send(
@@ -247,7 +249,6 @@ class TTSCog(commands.Cog):
             )
             return
 
-        # 2. ユーザーのボイス状態確認
         voice_state = interaction.user.voice
         if not voice_state or not voice_state.channel:
             await interaction.followup.send(
@@ -255,7 +256,6 @@ class TTSCog(commands.Cog):
             )
             return
 
-        # 3. チャンネルの型を VoiceChannel に限定
         channel = voice_state.channel
         if not isinstance(channel, discord.VoiceChannel):
             await interaction.followup.send(
@@ -263,7 +263,6 @@ class TTSCog(commands.Cog):
             )
             return
 
-        # 4. テキストチャンネルの型を TextChannel に限定
         text_channel = interaction.channel
         if not isinstance(text_channel, discord.TextChannel):
             await interaction.followup.send(
@@ -271,37 +270,29 @@ class TTSCog(commands.Cog):
             )
             return
 
-        # 5. 接続処理と VoiceClient の確保
         if guild.voice_client is None:
             vc = await channel.connect()
-            # 最初のレスポンス
             await interaction.followup.send(f"【{channel.name}】に接続しました。")
         else:
-            # すでに接続されている場合
             vc = cast(discord.VoiceClient, guild.voice_client)
-            # 既に接続済みである旨を伝える（既存の else ブロックの内容をここに集約）
             await interaction.followup.send("すでに接続しています。", ephemeral=True)
-            # 既に接続していても、読み上げチャンネルの更新などは行いたい場合があるため続行
 
-        # 6. 状態の保存
         guild_id = guild.id
         self.text_channels[guild_id] = text_channel
         self.voice_clients[guild_id] = vc
         self.voice_channels[guild_id] = channel
 
-        # 7. 読み上げ用データの作成と投入
         announcement_text = f"【{channel.name}】に参加しました。"
 
-        join_data= cast(
+        join_data = cast(
             TTSQueueItem,
             {
                 "guild_id": guild_id,
                 "author_id": guild.me.id,
                 "content": announcement_text,
-                # 参加通知も単一セグメント
                 "sequence_number": 0,
                 "total_segments": 1,
-            }
+            },
         )
 
         if self.queue is not None:
@@ -312,7 +303,6 @@ class TTSCog(commands.Cog):
         description="自分が送信した、または全ユーザーの未再生の読み上げキューをクリアします。",
     )
     async def skip_my_voice(self, interaction: discord.Interaction):
-        """自分が送信した未再生の読み上げキューをすべて削除し、現在再生中なら止める"""
         await interaction.response.defer()
 
         guild_id = interaction.guild.id if interaction.guild else None
@@ -323,47 +313,30 @@ class TTSCog(commands.Cog):
             return
 
         author_id = interaction.user.id
-        # 管理者かどうかの判定 (Interaction.userはGuild内ではMember型)
         is_admin = False
         if isinstance(interaction.user, discord.Member):
             is_admin = interaction.user.guild_permissions.administrator
 
-        # 1. 現在再生中の音声が「自分のもの」か、または「自分が管理者」なら止める
         vc = self.voice_clients.get(guild_id)
-        if vc and vc.is_playing():
-            if is_admin:
-                vc.stop()
-                await interaction.followup.send(
-                    "管理者の権限で現在の再生を停止したよ。"
-                )
-            else:
-                # 一般ユーザーの場合は、誤コピペ対策として安全にキューの削除側をメインにするよ
-                pass
-
-        # 2. まだ生成前のメインキュー（self.queue）から対象のデータを間引く
+        if vc and vc.is_playing() and is_admin:
+            vc.stop()
+            await interaction.followup.send(
+                "管理者の権限で現在の再生を停止したよ。"
+            )
         if self.queue and not self.queue.empty():
             temp_list = []
             while not self.queue.empty():
                 try:
                     item = self.queue.get_nowait()
-                    # 管理者なら全部消す（残さない）、一般ユーザーなら他人のデータだけ残す
                     if not is_admin and item.get("author_id") != author_id:
                         temp_list.append(item)
                 except asyncio.QueueEmpty:
                     break
-            # 残ったデータをキューに戻す
             for item in temp_list:
                 await self.queue.put(item)
 
-        # 3. 再生待ちバッファ（self.play_groups）から対象データを削除する
-        if guild_id in self.play_groups:
-            # 管理者の場合はギルドのバッファ全体を吹き飛ばす
-            if is_admin:
-                self.play_groups.pop(guild_id, None)
-            else:
-                # 一般ユーザーの場合は、現状の構造に合わせてキュー側の間引きに留めるか、
-                # 必要に応じてgroup_dictのフィルタリングロジックをここに追加できるよ
-                pass
+        if guild_id in self.play_groups and is_admin:
+            self.play_groups.pop(guild_id, None)
 
         await interaction.followup.send(
             f"{interaction.user.display_name}さんの未再生の読み上げキューをクリアしたよ。"
@@ -388,28 +361,23 @@ class TTSCog(commands.Cog):
 
             announcement_text = "読み上げを終わります"
 
-            # 1. 読み上げキューに追加
-            leave_data= cast(
-            TTSQueueItem,
+            leave_data = cast(
+                TTSQueueItem,
                 {
                     "guild_id": guild_id,
                     "author_id": bot_member.id,
                     "content": announcement_text,
                     "sequence_number": 0,
                     "total_segments": 1,
-                }
+                },
             )
 
             if self.queue is not None:
                 await self.queue.put(leave_data)
 
-                # 2. キューが処理され、再生が始まるまで少し待つ
-                # (投入直後にempty判定をすると、処理が早すぎてループを抜ける可能性があるからね)
                 await asyncio.sleep(0.5)
 
-                # 3. 「キューが空」かつ「再生中ではない」状態になるまで待機
-                # 念のためタイムアウト（例: 10秒）を設けておくと、万が一の無限ループを防げるよ
-                max_wait = 20  # 10秒 (0.5s * 20)
+                max_wait = 20
                 wait_count = 0
                 while (
                     not self.queue.empty()
@@ -419,11 +387,9 @@ class TTSCog(commands.Cog):
                     await asyncio.sleep(0.5)
                     wait_count += 1
 
-            # 4. 読み上げ終わってから切断
             if vc.is_connected():
                 await vc.disconnect()
 
-            # データの削除
             self.text_channels.pop(guild_id, None)
             self.voice_clients.pop(guild_id, None)
             self.voice_channels.pop(guild_id, None)
@@ -471,7 +437,6 @@ class TTSCog(commands.Cog):
             if os.path.exists(cache_path):
                 return cache_path
 
-            # APIリクエストのパラメータ作成
             request_body = {
                 "text": text,
                 "styleId": style_id,
@@ -492,8 +457,6 @@ class TTSCog(commands.Cog):
                 "speakerUuid": style_uuid,
             }
 
-            # 外部通信なので、本来は aiohttp を使うのが理想ですが、
-            # 現状の requests を使う場合は別スレッドで実行してブロックを防ぎます
             def call_api():
                 return requests.post(
                     url="http://localhost:50032/v1/synthesis",
@@ -506,10 +469,8 @@ class TTSCog(commands.Cog):
                 )
 
             loop = asyncio.get_event_loop()
-            # COEIROINK の制約を守るため、API 実行を同時に1つに制限する
             try:
                 async with self.api_semaphore:
-                    # 外部コールは長時間かかる可能性があるためタイムアウトを設ける
                     response = await asyncio.wait_for(
                         loop.run_in_executor(None, call_api), timeout=30.0
                     )
@@ -518,7 +479,6 @@ class TTSCog(commands.Cog):
                 return None
 
             if response.status_code == 200:
-                # ファイル書き込みを別スレッドで実行してイベントループを止めないようにするよ
                 await asyncio.to_thread(
                     Path(cache_path).write_bytes, response.content
                 )
@@ -526,14 +486,12 @@ class TTSCog(commands.Cog):
                 return cache_path
 
             return None
-        # 通信エラーやファイル保存エラーなど、具体的な例外に絞ってキャッチするよ
         except (requests.RequestException, OSError) as e:
             self.logger.error(f"Prepare audio error: {e}")
             return None
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        # 1. Bot自身のメッセージやギルド外は無視
         if message.author.bot or not message.guild:
             return
 
@@ -551,14 +509,11 @@ class TTSCog(commands.Cog):
             or not member.voice
             or not member.voice.channel
         ):
-            # VCにそもそも入っていない場合、警告を出して「読み上げ処理だけ」を終了する
             await self._send_and_delete_warning(message.channel)
             return
 
-        # Botが接続しているボイスチャンネルと一致するかチェック
         bot_vc = self.voice_channels.get(guild_id)
         if bot_vc and member.voice.channel.id != bot_vc.id:
-            # 別のVCに入っている場合も、警告を出して「読み上げ処理だけ」を終了する
             await self._send_and_delete_warning(message.channel)
             return
 
@@ -570,16 +525,13 @@ class TTSCog(commands.Cog):
             else datetime.fromtimestamp(0, tz=timezone.utc)
         )
 
-        # 連続投稿判定
         is_continuous = (
             self.last_speaker_id.get(guild_id) == message.author.id
             and (now - last_time).total_seconds() < 60
         )
 
-        # --- 読み上げ対象のセグメントを構築 ---
         segments = []
 
-        # 1. 名前の追加（連続投稿でない場合）
         if not is_continuous:
             if message.author.id == self.owner_id:
                 name = f"{logic.process_name(self.owner_display_name, self.dict_manager)}さん。 "
@@ -590,7 +542,6 @@ class TTSCog(commands.Cog):
                 name = f"{clean_name if clean_name else '名無し'}さん。 "
             segments.append(name)
 
-        # 2. 本文の追加
         processed_text, effects = logic.process_text(
             message.content, message.guild, self.dict_manager, self.bot
         )
@@ -599,14 +550,12 @@ class TTSCog(commands.Cog):
 
         MAX_SEGMENTS = 10
         if len(segments) > MAX_SEGMENTS:
-            # 設定数に切り詰めて、最後に「以下略」などを付け足す
             segments = segments[:MAX_SEGMENTS]
             segments.append("以下略。")
 
         if not segments:
             return
 
-        # --- キュー投入処理の共通化 ---
         total_segments = len(segments)
         cnt = self.play_group_counters.get(guild_id, 0)
         group_id = f"legacy-{guild_id}-{cnt}"
@@ -617,7 +566,6 @@ class TTSCog(commands.Cog):
         self._update_se_keywords()
 
         for seq_idx, content in enumerate(segments):
-            # SEチェック
             se_path = self.se_keywords.get(content)
             if se_path:
                 await self.play_waiting_queue.put(
@@ -630,52 +578,48 @@ class TTSCog(commands.Cog):
                             "sequence_number": seq_idx,
                             "total_segments": total_segments,
                             "effects": effects,
-                        }
+                        },
                     )
                 )
                 continue
 
-            # キャッシュチェック
             cache_path = self.cache_manager.get_cache_path(content, style_uuid)
             if os.path.exists(cache_path):
                 await self.play_waiting_queue.put(
                     cast(
-                            TTSQueueItem,
-                            {
-                                "guild_id": guild_id,
-                                "group_id": group_id,
-                                "file_path": cache_path,
-                                "sequence_number": seq_idx,
-                                "total_segments": total_segments,
-                                "effects": effects,
-                            }
-                        )
+                        TTSQueueItem,
+                        {
+                            "guild_id": guild_id,
+                            "group_id": group_id,
+                            "file_path": cache_path,
+                            "sequence_number": seq_idx,
+                            "total_segments": total_segments,
+                            "effects": effects,
+                        },
                     )
+                )
             else:
-                # 生成が必要な場合
                 await self.queue.put(
                     cast(
-                            TTSQueueItem,
-                            {
-                                "guild_id": guild_id,
-                                "group_id": group_id,
-                                "author_id": message.author.id,
-                                "content": content,
-                                "sequence_number": seq_idx,
-                                "total_segments": total_segments,
-                                "effects": effects,
-                            }
-                        )
-                    )  
+                        TTSQueueItem,
+                        {
+                            "guild_id": guild_id,
+                            "group_id": group_id,
+                            "author_id": message.author.id,
+                            "content": content,
+                            "sequence_number": seq_idx,
+                            "total_segments": total_segments,
+                            "effects": effects,
+                        },
+                    )
+                )
 
-        # 履歴を更新
         self.last_speaker_id[guild_id] = message.author.id
         self.last_speak_time[guild_id] = now
 
         await self.bot.process_commands(message)
 
     async def _send_and_delete_warning(self, channel: discord.abc.Messageable) -> None:
-        """警告メッセージを送信し、10秒後に自動削除する"""
         try:
             warn_msg = await channel.send(
                 "読み上げをスキップしました。読み上げるためには参加してください"
@@ -683,43 +627,32 @@ class TTSCog(commands.Cog):
             await asyncio.sleep(10)
             await warn_msg.delete()
         except discord.NotFound:
-            # 10秒経つ前にユーザーがメッセージを消していた場合のクリーンアップ
             pass
         except discord.HTTPException as e:
             self.logger.error(f"Failed to handle warning message: {e}")
 
     @tasks.loop(seconds=0.1)
     async def generation_loop(self):
-        """
-        キューからアイテムを取り出して、生成ワーカーを非同期タスクとして作成するだけに役割を限定する。
-        実際の API 呼び出し（prepare_audio）は専用ワーカーで行い、COEIROINK 制約のため Semaphore で保護される。
-        """
         if self.queue is None or self.queue.empty():
             return
 
         item = await self.queue.get()
 
         try:
-            # ワーカーを作成してバックグラウンドで処理させる
             task = asyncio.create_task(self._generation_worker(item))
-            # アイテムの完了を queue.task_done() で通知するためのコールバックを登録
             task.add_done_callback(lambda t, q=self.queue: q.task_done())
         except Exception as e:  # noqa: BLE001
             self.logger.error(f"Generation scheduling error: {e}")
-            # スケジューリング自体が失敗したら明示的に task_done() を呼ぶ
-            # ValueError (呼び出しすぎ) が起きても安全に無視するよ
             with suppress(ValueError):
                 self.queue.task_done()
 
     async def _generation_worker(self, item):
-        """実際の生成処理を行うワーカー（バックグラウンド実行）"""
         guild_id = item.get("guild_id")
         author_id = item.get("author_id")
         content = item.get("content")
         custom_file = item.get("file_path")
         effects = item.get("effects")
 
-        # Ensure a group_id is present (propagate from incoming item or generate a legacy one)
         group_id = item.get("group_id")
         if group_id is None:
             cnt = self.play_group_counters.get(guild_id, 0)
@@ -727,7 +660,6 @@ class TTSCog(commands.Cog):
             self.play_group_counters[guild_id] = cnt + 1
 
         try:
-            # 1. すでにファイルがある場合（Bump音など）
             if custom_file and os.path.exists(custom_file):
                 seq = item.get("sequence_number", 0)
                 total = item.get("total_segments", 1)
@@ -741,14 +673,12 @@ class TTSCog(commands.Cog):
                             "sequence_number": seq,
                             "total_segments": total,
                             "effects": effects,
-                        }
+                        },
                     )
                 )
                 return
 
-            # 2. テキストから生成する場合
             if content:
-
                 try:
                     audio_path = await asyncio.wait_for(
                         self.prepare_audio(content, author_id), timeout=40.0
@@ -778,11 +708,10 @@ class TTSCog(commands.Cog):
                                 "sequence_number": seq,
                                 "total_segments": total,
                                 "effects": effects,
-                            }
+                            },
                         )
                     )
                 else:
-                    # 生成失敗またはタイムアウト: 永久待ちにならないように「スキップ」を示すエントリを投入する
                     await self.play_waiting_queue.put(
                         cast(
                             TTSQueueItem,
@@ -793,16 +722,15 @@ class TTSCog(commands.Cog):
                                 "sequence_number": seq,
                                 "total_segments": total,
                                 "effects": effects,
-                            }
+                            },
                         )
                     )
 
-        except Exception as e: # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
             self.logger.error(f"Generation worker error: {e}")
 
     @tasks.loop(seconds=0.01)
     async def playback_loop(self):
-        """再生待ちキューにある音声を順次再生する（グループ単位の階層化）"""
         if not hasattr(self, "play_groups") or not hasattr(self, "play_group_counters"):
             self.play_groups = {}
             self.play_group_counters = {}
@@ -818,7 +746,6 @@ class TTSCog(commands.Cog):
 
                     guild_id = item.get("guild_id")
                     if guild_id is None:
-                        # ValueError（呼び出しすぎ）が発生しても安全に無視するよ
                         with suppress(ValueError):
                             self.play_waiting_queue.task_done()
                         continue
@@ -854,11 +781,9 @@ class TTSCog(commands.Cog):
                             group_id, None
                         )
 
-                    # ここも suppress で受け取れば例外ログも出ず綺麗に処理できるよ
                     with suppress(ValueError):
                         self.play_waiting_queue.task_done()
 
-            # 一番外側の try に対応する except はここ！
             except Exception as e:  # noqa: BLE001
                 self.logger.debug(f"Drain error in playback: {e}")
 
@@ -868,7 +793,6 @@ class TTSCog(commands.Cog):
             if not groups:
                 continue
 
-            # 安全に先頭要素を特定するため、keysのリストコピーから取得
             group_keys = list(groups.keys())
             if not group_keys:
                 continue
@@ -939,7 +863,10 @@ class TTSCog(commands.Cog):
                     next_path = next_item.get("file_path")
 
                 await self._play_audio_and_wait(
-                    vc, audio_path, next_audio_path=next_path, effects=item.get("effects"),
+                    vc,
+                    audio_path,
+                    next_audio_path=next_path,
+                    effects=item.get("effects"),
                 )
 
                 group["next_index"] = expected_idx + 1
@@ -953,7 +880,7 @@ class TTSCog(commands.Cog):
                 if not group["items"] and not group.get("generating", False):
                     groups.pop(group_id, None)
                 return
-            except Exception as e: # noqa: BLE001
+            except Exception as e:  # noqa: BLE001
                 self.logger.error(
                     f"Playback error in guild {guild_id}, group {group_id}: {e}"
                 )
@@ -1026,14 +953,12 @@ class TTSCog(commands.Cog):
         if guild_id not in self.voice_clients:
             return
 
-        # --- 2. 共通の名前決定ロジック (間を詰めるための加工込み) ---
+        # --- 2. 共通の名前決定ロジック ---
         if member.id == self.owner_id:
-            # オーナー名にも辞書を適用したい場合は logic.process_name を通す
             name_to_read = (
                 f"{logic.process_name(self.owner_display_name, self.dict_manager)}"
             )
         else:
-            # 一般ユーザーの名前に辞書を適用
             clean_name = logic.process_name(member.display_name, self.dict_manager)
             if clean_name:
                 name_to_read = f"{clean_name}さん"
@@ -1046,23 +971,18 @@ class TTSCog(commands.Cog):
         target_vc = self.voice_channels.get(guild_id)
 
         if target_vc:
-            # 参加
             if (
                 before.channel is None
                 and after.channel is not None
                 and after.channel.id == target_vc.id
             ):
                 action_text = "が参加しました"
-
-            # 退出
             elif (
                 before.channel is not None
                 and after.channel is None
                 and before.channel.id == target_vc.id
             ):
                 action_text = "が退出しました"
-
-            # カメラ・配信（参加・退出以外のイベントで、対象VCにいる場合）
             elif after.channel is not None and after.channel.id == target_vc.id:
                 b_video = getattr(before, "self_video", False)
                 a_video = getattr(after, "self_video", False)
@@ -1078,7 +998,6 @@ class TTSCog(commands.Cog):
                 elif b_stream and not a_stream:
                     action_text = "がライブ配信を終了しました"
 
-        # アクションがあれば「名前＋アクション」でキューに入れる
         if action_text:
             if self.queue is not None:
                 await self.queue.put(
@@ -1090,15 +1009,15 @@ class TTSCog(commands.Cog):
                             "content": f"{name_to_read}{action_text}",
                             "sequence_number": 0,
                             "total_segments": 1,
-                        }
-                    ))
+                        },
+                    )
+                )
             else:
                 self.logger.warning(
                     "Queue is not initialized. Skipping action notification."
                 )
 
         # --- 4. 自動切断処理 ---
-        # 抜けたのがBot自身である場合は、この切断判定処理を行う必要はないからリターンするよ
         if self.bot.user and member.id == self.bot.user.id:
             return
 
@@ -1108,10 +1027,8 @@ class TTSCog(commands.Cog):
             managed_channel = self.voice_channels.get(guild_id)
 
             if managed_channel and left_channel.id == managed_channel.id:
-                # チャンネルに残っている「Bot以外の人間」の数を正確に数える
                 human_members = [m for m in left_channel.members if not m.bot]
 
-                # 人間が0人（Botだけ、または誰もいない）になったら即座に切断！
                 if len(human_members) == 0:
                     await self.immediate_disconnect(guild_id)
 
@@ -1120,20 +1037,16 @@ class TTSCog(commands.Cog):
         self.logger.info(f"Immediate disconnect triggered for guild: {guild_id}")
         vc = self.voice_clients.get(guild_id)
 
-        # 1. 物理的な切断を最優先で行う
         if vc:
             try:
                 if vc.is_playing():
                     vc.stop()
                 await vc.disconnect(force=True)
-            except Exception as e: # noqa: BLE001
+            except Exception as e:  # noqa: BLE001
                 self.logger.error(f"Failed to disconnect cleanly: {e}")
 
-        # 2. 状態管理フラグの初期化
         self.is_reading[guild_id] = False
 
-        # 3. 再生バッファ（play_groups）の完全消去【最重要】
-        # メモリ上に残っている未再生セグメントをギルド単位で完全に消し去るよ
         if hasattr(self, "play_groups") and guild_id in self.play_groups:
             self.play_groups.pop(guild_id, None)
         if (
@@ -1144,9 +1057,6 @@ class TTSCog(commands.Cog):
         if hasattr(self, "play_wait_start") and guild_id in self.play_wait_start:
             self.play_wait_start.pop(guild_id, None)
 
-        # 4. 非同期キュー（内部全データ）のクリーンアップ
-        # 特定のギルドのものだけを抜くことはキューの性質上難しいため、
-        # 誰もいなくなった時は、安全のために一度詰まっているものをドレインする
         if self.queue:
             while not self.queue.empty():
                 try:
@@ -1161,9 +1071,7 @@ class TTSCog(commands.Cog):
                 except asyncio.QueueEmpty:
                     break
 
-        # 5. データ削除とチャンネル通知（メッセージを送らずに即切断したい場合は、sendの行をコメントアウトしてね）
         if guild_id in self.text_channels:
-            # 「読み上げを終了します」などの発話を挟まず、テキスト通知だけに留めるか、不要なら消して大丈夫だよ
             try:
                 await self.text_channels[guild_id].send(
                     "メンバーがいなくなったため、キューを破棄して切断しました。"
