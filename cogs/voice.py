@@ -85,7 +85,7 @@ class VoiceCog(commands.Cog):
                 text_channel = guild.get_channel(config.get("text_channel_id"))
                 if isinstance(text_channel, discord.TextChannel) and isinstance(
                     after.channel, discord.VoiceChannel
-                
+
                 ):
                     try:
                         vc = await after.channel.connect()
@@ -280,32 +280,63 @@ class VoiceCog(commands.Cog):
         last_time = raw_last_time if isinstance(raw_last_time, datetime) else datetime.fromtimestamp(0, tz=timezone.utc)
 
         is_continuous = (self.last_speaker_id.get(guild_id) == message.author.id and (now - last_time).total_seconds() < 60)
-        segments = []
 
+        # 1. テキストの基本整形（文字置換や辞書適用）
+        processed_text = logic.process_text(message.content, message.guild, self.dict_manager, self.bot)
+
+        # 2. 句読点や改行で本文を文ごとに分割
+        raw_segments = [s for s in logic.split_text(processed_text) if s.strip()]
+
+        if len(raw_segments) > 50:
+            raw_segments = raw_segments[:50]
+            raw_segments.append("以下略。")
+
+        # 3. (テキスト, エフェクト) のペアを格納するリストを作成
+        # (テキスト, エフェクト) のペアを格納するリスト
+        segments_with_effects: list[tuple[str, dict[str, bool]]] = []
+
+        # 連続発言でない場合は名前を追加 (名前にはエフェクトなし)
         if not is_continuous:
             if message.author.id == self.owner_id:
                 name = f"{logic.process_name(self.owner_display_name, self.dict_manager)}さん。 "
             else:
                 clean_name = logic.process_name(message.author.display_name, self.dict_manager)
                 name = f"{clean_name if clean_name else '名無し'}さん。 "
-            segments.append(name)
+            segments_with_effects.append((name, {}))
 
-        processed_text, effects = logic.process_text(message.content, message.guild, self.dict_manager, self.bot)
-        non_empty_body = [s for s in logic.split_text(processed_text) if s.strip()]
-        segments.extend(non_empty_body)
+        # ★ 行単位（改行）でループ処理する
+        lines = message.content.splitlines()
 
-        if len(segments) > 10:
-            segments = segments[:10]
-            segments.append("以下略。")
+        for line in lines:
+            if not line.strip():
+                continue
 
-        if not segments:
+            # 1. まず「行頭記号 (#, ##, ###, -#, >)」を抽出・除去
+            line_text, line_effects = logic.extract_line_effects(line)
+
+            # 2. テキストの基本整形（辞書適用や文字置換など）
+            processed_line = logic.process_text(line_text, message.guild, self.dict_manager, self.bot)
+
+            # 3. 句読点などで細かくセグメント分割
+            raw_segments = [s for s in logic.split_text(processed_line) if s.strip()]
+
+            # 4. 各セグメントに対して「インライン記号 (**, ~~ など)」を抽出
+            for seg in raw_segments:
+                clean_seg, inline_effects = logic.extract_inline_effects(seg)
+                if clean_seg.strip():
+                    # 行頭エフェクトとインラインエフェクトを合体！
+                    combined_effects = {**line_effects, **inline_effects}
+                    segments_with_effects.append((clean_seg, combined_effects))
+
+        if not segments_with_effects:
             return
 
-        total_segments = len(segments)
+        total_segments = len(segments_with_effects)
         group_id = self.audio_engine.generate_group_id(guild_id)
         style_uuid, _ = self.get_style(message.author.id)
 
-        for seq_idx, content in enumerate(segments):
+        # ★ 修正ポイント: segments_with_effects をループして content と effects を両方取得する！
+        for seq_idx, (content, effects) in enumerate(segments_with_effects):
             se_path = self.se_keywords.get(content)
             if se_path:
                 await self.audio_engine.enqueue_play_waiting({
@@ -319,17 +350,15 @@ class VoiceCog(commands.Cog):
             else:
                 cache_path = self.audio_engine.cache_manager.get_cache_path(content, style_uuid)
                 if cache_path.exists():
-                    # 1. キャッシュが存在するなら、保存済み音声ファイルを直接再生！
                     await self.audio_engine.enqueue_play_waiting({
-                        "guild_id": guild_id, 
-                        "group_id": group_id, 
+                        "guild_id": guild_id,
+                        "group_id": group_id,
                         "file_path": str(cache_path),
-                        "sequence_number": seq_idx, 
-                        "total_segments": total_segments, 
+                        "sequence_number": seq_idx,
+                        "total_segments": total_segments,
                         "effects": effects,
                     })
                 else:
-                    # 2. キャッシュがない場合のみ、音声合成APIを呼び出すキューに追加！
                     await self.audio_engine.enqueue({
                         "guild_id": guild_id,
                         "group_id": group_id,
