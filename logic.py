@@ -12,7 +12,6 @@ OWNER_DISPLAY_NAME = os.getenv("OWNER_DISPLAY_NAME", "マスター")
 
 REPLACEMENT_PATTERNS = {
     "url": (r"https?://[^\s　]+", "ユーアールエル省略"),
-    "spoiler": (r"\|\|(.+?)\|\|", "スポイラー省略"),
     "no": (r"no\.?([0-9])", r"ナンバー\1"),
     "a_particle": (r"a ([a-z])", r"アッ \1"),
 }
@@ -83,20 +82,76 @@ def split_text(text: str) -> list[str]:
 
     return processed
 
+def extract_markdown_effects(text: str) -> tuple[str, dict[str, bool]]:
+    """
+    Markdown記法を検出し、エフェクトフラグと記号除去後のテキストを返す
+    """
+    effects = {
+        "header_1": False,  # # 大見出し
+        "header_2": False,  # ## 中見出し
+        "header_3": False,  # ### 小見出し
+        "subtext": False,   # -# サブテキスト
+        "loud": False,      # **太字**
+        "fast": False,      # *斜体*
+        "low": False,       # ~~打ち消し~~
+        "spoiler": False,   # ||スポイラー||
+        "code": False,      # `コード`
+        "quote": False,     # > 引用
+    }
+
+    if not text:
+        return "", effects
+
+    # 1. 行頭装飾（見出し・サブテキスト・引用）
+    if re.match(r"^###\s+", text):
+        effects["header_3"] = True
+        text = re.sub(r"^###\s+", "", text)
+    elif re.match(r"^##\s+", text):
+        effects["header_2"] = True
+        text = re.sub(r"^##\s+", "", text)
+    elif re.match(r"^#\s+", text):
+        effects["header_1"] = True
+        text = re.sub(r"^#\s+", "", text)
+
+    if re.match(r"^-#\s+", text):
+        effects["subtext"] = True
+        text = re.sub(r"^-#\s+", "", text)
+
+    if re.match(r"^>\s+", text):
+        effects["quote"] = True
+        text = re.sub(r"^>\s+", "", text)
+
+    # 2. インライン装飾（太字・斜体・打ち消し・スポイラー・コード）
+    if re.search(r"\*\*.*?\*\*", text):
+        effects["loud"] = True
+        text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
+
+    if re.search(r"(\*|_).*?(\*|_)", text):
+        effects["fast"] = True
+        text = re.sub(r"(\*|_)(.*?)\1", r"\2", text)
+
+    if re.search(r"~~.*?~~", text):
+        effects["low"] = True
+        text = re.sub(r"~~(.*?)~~", r"\1", text)
+
+    if re.search(r"\|\|.*?\|\|", text):
+        effects["spoiler"] = True
+        text = re.sub(r"\|\|(.*?)\|\|", r"\1", text)
+
+    if re.search(r"`.*?`", text):
+        effects["code"] = True
+        text = re.sub(r"`(.*?)`", r"\1", text)
+
+    return text, effects
 
 def process_text(
     text: str, guild: discord.Guild | None, dict_manager: object, bot: discord.Client
-) -> str:
-    """純粋な文字列(text)を受け取り、TTS用に加工して返す
-
-    変更点（ハイブリッド剥離計画）:
-    - 最終段階で記号の超正規化を行い、キャッシュの揺れを排除する。
-      * 半角/全角の '!'、'.' を '。' に統一（最終的に削除される想定）
-      * 半角 '?' を全角 '？' に統一して保持（疑問符アクセントのため）
-    """
+) -> tuple[str, dict[str, bool]]:
     if not text:
-        return ""
+        return "", {}
 
+    text, effects = extract_markdown_effects(text)
+    
     # 1. メンション置換
     text = _replace_mentions(text, guild, bot)
 
@@ -136,7 +191,7 @@ def process_text(
     # 前後の空白削除
     text = text.strip()
 
-    return text
+    return text, effects
 
 
 def process_name(name: str, dict_manager: object) -> str:
@@ -352,3 +407,51 @@ def _apply_alkana(text: str) -> str:
             else:
                 processed += segment
     return processed
+
+def build_ffmpeg_options(effects: dict[str, bool] | None) -> str:
+    """エフェクト情報から FFmpeg の -af オプション文字列を生成する"""
+    if not effects:
+        return ""
+
+    filters = []
+
+    # スポイラー（逆再生を最優先で適用）
+    if effects.get("spoiler"):
+        filters.append("areverse")
+
+    # 見出し系
+    if effects.get("header_1"):
+        filters.append("volume=1.8,equalizer=f=100:width_type=h:width=200:g=8")
+    elif effects.get("header_2"):
+        filters.append("volume=1.4")
+    elif effects.get("header_3"):
+        filters.append("asetrate=24000*1.08,aresample=24000")
+
+    # サブテキスト (-# )
+    if effects.get("subtext"):
+        filters.append("volume=0.6,lowpass=f=1500")
+
+    # 引用 (> )
+    if effects.get("quote"):
+        filters.append("aecho=0.8:0.88:60:0.4")
+
+    # 太字 (**)
+    if effects.get("loud"):
+        filters.append("volume=1.3")
+
+    # 斜体 (*)
+    if effects.get("fast"):
+        filters.append("atempo=1.25")
+
+    # 打ち消し線 (~~)
+    if effects.get("low"):
+        filters.append("asetrate=24000*0.85,aresample=24000")
+
+    # コード (`)
+    if effects.get("code"):
+        filters.append("flanger=delay=2:depth=5")
+
+    if not filters:
+        return ""
+
+    return f'-af "{",".join(filters)}"'
