@@ -8,11 +8,11 @@ import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 
-from cache_manager import VoiceCacheManager
 from cogs.config import ConfigCog
 from cogs.voice import VoiceCog
 from services.audio_engine import AudioEngine
 from services.bump_server import BumpServer
+from services.cache_manager import VoiceCacheManager
 
 _ = load_dotenv()
 
