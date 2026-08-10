@@ -7,7 +7,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from dictionary_manager import DictionaryManager
+from services.dictionary_manager import DictionaryManager
 
 
 class DictionaryCog(commands.Cog):
