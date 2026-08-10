@@ -3,11 +3,13 @@ import logging
 import os
 import random
 import re
-from collections.abc import Callable
-from typing import Any, TypedDict, cast
+from collections.abc import Awaitable, Callable
+from typing import TypedDict, cast
 
 import discord
 from aiohttp import web
+
+from services.audio_engine import TTSQueueItem
 
 
 class BumpNotificationData(TypedDict):
@@ -19,10 +21,10 @@ class BumpServer:
     def __init__(
         self,
         bot: discord.Client,
-        enqueue_func: Callable[[dict[str, Any]], Any],
+        enqueue_func: Callable[[TTSQueueItem], Awaitable[None]],
         is_vc_connected_func: Callable[[int], bool],
         host: str = "0.0.0.0",
-        port: int = 8080,
+        port: int = 50030,
     ):
         self.bot = bot
         self.enqueue_func = enqueue_func
@@ -34,11 +36,10 @@ class BumpServer:
         self.runner: web.AppRunner | None = None
 
         # ルーティング設定
-        self.app.router.add_post("/bump", self.handle_bump_notification)
+        self.app.router.add_post("/bot_tts_gttegldxdzmyrohd", self.handle_bump_notification)
 
     @staticmethod
     def _pick_random_file(base_path: str) -> str | None:
-        """ディレクトリ名の数値に基づき、再帰的にファイルを抽選する。"""
         if not os.path.exists(base_path):
             return None
 
@@ -68,7 +69,6 @@ class BumpServer:
         return chosen
 
     async def handle_bump_notification(self, request: web.Request) -> web.Response:
-        """外部サービスからの POST リクエストを受け取りキューへ追加する"""
         try:
             body = await request.json()
             data = cast(BumpNotificationData, body)
@@ -81,7 +81,6 @@ class BumpServer:
 
             guild_id = int(raw_guild_id)
 
-            # VC接続状態のチェック (コールバック経由)
             if not self.is_vc_connected_func(guild_id):
                 return web.Response(text="Accepted but no VC connection", status=202)
 
@@ -100,7 +99,7 @@ class BumpServer:
                 return web.Response(text="Guild not found", status=404)
 
             bot_member = guild.me
-            queue_item = {
+            queue_item: TTSQueueItem = {
                 "guild_id": guild_id,
                 "author_id": bot_member.id,
                 "content": original_message,
@@ -109,7 +108,6 @@ class BumpServer:
                 "total_segments": 1,
             }
 
-            # キュー投入処理 (コールバック経由)
             await self.enqueue_func(queue_item)
             self.logger.info(f"✅ {log_msg}")
             return web.Response(text="Success", status=200)
@@ -119,7 +117,6 @@ class BumpServer:
             return web.Response(text=str(e), status=500)
 
     async def start(self) -> None:
-        """HTTP サーバーを開始する"""
         self.runner = web.AppRunner(self.app)
         await self.runner.setup()
         site = web.TCPSite(self.runner, self.host, self.port)
@@ -127,7 +124,6 @@ class BumpServer:
         self.logger.info(f"Bump notification HTTP server running on {self.host}:{self.port}")
 
     async def stop(self) -> None:
-        """HTTP サーバーを停止する"""
         if self.runner:
             await self.runner.cleanup()
             self.logger.info("Bump notification HTTP server stopped")
