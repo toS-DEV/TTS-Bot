@@ -3,6 +3,7 @@ import json
 import logging
 import os
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any, TypedDict, cast
 
 
@@ -14,12 +15,13 @@ class AutoJoinConfig(TypedDict):
 class ConfigStore:
     def __init__(
         self,
-        prefs_path: str = "prefs.json",
-        auto_join_path: str = "auto_join_config.json",
+        prefs_path: str | Path = "data/prefs.json",
+        auto_join_path: str | Path = "data/auto_join_config.json",
         logger: logging.Logger | None = None,
     ):
-        self.prefs_path = prefs_path
-        self.auto_join_path = auto_join_path
+        self.prefs_path = Path(prefs_path)
+        self.auto_join_path = Path(auto_join_path)
+        self.prefs_path.parent.mkdir(parents=True, exist_ok=True)
         self.logger = logger or logging.getLogger("bot.config_store")
 
         self.prefs: dict[str, dict[str, Any]] = self.load_prefs()
