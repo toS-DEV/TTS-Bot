@@ -11,10 +11,11 @@ class DictionaryManager:
 
     def __init__(
         self,
-        file_path: str | Path = "custom_dict.json",
+        file_path: str | Path = "data/custom_dict.json",
         logger: logging.Logger | None = None,
     ) -> None:
         self.file_path = Path(file_path)
+        self.file_path.parent.mkdir(parents=True, exist_ok=True)
         self.logger = logger or logging.getLogger("bot.dictionary_manager")
         self._dict: dict[str, str] = {}
         self.load_dictionary()
