@@ -59,6 +59,115 @@ class VoiceCog(commands.Cog):
         s_dict = cast(VoiceStyle, style_pref)
         return str(s_dict["uuid"]), int(s_dict["style_id"])
 
+    # ------------------------------------------------------------------
+    # 自動参加 & ボイス状態更新イベント
+    # ------------------------------------------------------------------
+    @commands.Cog.listener()
+    async def on_voice_state_update(
+        self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState
+    ) -> None:
+        """ユーザーのVC入退出を監視し、自動参加および無人切断を行う"""
+        if member.bot or not member.guild:
+            return
+
+        guild = member.guild
+        guild_id = guild.id
+
+        # 1. 自動参加ロジック (VCに入室したとき)
+        if after.channel and before.channel != after.channel:
+            config = self.config_store.get_auto_join_config(guild_id)
+            is_connected = guild_id in self.voice_clients and self.voice_clients[guild_id].is_connected()
+            if (
+                config
+                and config.get("voice_channel_id") == after.channel.id
+                and not is_connected
+            ):
+                text_channel = guild.get_channel(config.get("text_channel_id"))
+                if isinstance(text_channel, discord.TextChannel) and isinstance(
+                    after.channel, discord.VoiceChannel
+                
+                ):
+                    try:
+                        vc = await after.channel.connect()
+                        self.voice_clients[guild_id] = vc
+                        self.text_channels[guild_id] = text_channel
+                        self.voice_channels[guild_id] = after.channel
+
+                        await self.audio_engine.enqueue({
+                            "guild_id": guild_id,
+                            "author_id": guild.me.id,
+                            "content": f"自動参加しました。【{after.channel.name}】の読み上げを開始します。",
+                            "sequence_number": 0,
+                            "total_segments": 1,
+                        })
+                        self.logger.info(
+                            f"Auto-joined {after.channel.name} in {guild.name}"
+                        )
+                    except Exception:
+                        self.logger.exception(
+                            f"Failed to auto-join VC in {guild.name}"
+                        )
+
+        # 2. 自動切断ロジック (VCにBot以外のメンバーがいなくなったとき)
+        if before.channel and guild_id in self.voice_clients:
+            bot_vc = self.voice_channels.get(guild_id)
+            if bot_vc and before.channel.id == bot_vc.id:
+                # Bot以外のメンバー（非Bot）数をカウント
+                non_bot_members = [m for m in bot_vc.members if not m.bot]
+                if len(non_bot_members) == 0:
+                    vc = self.voice_clients[guild_id]
+                    if vc.is_connected():
+                        await vc.disconnect()
+
+                    self.text_channels.pop(guild_id, None)
+                    self.voice_clients.pop(guild_id, None)
+                    self.voice_channels.pop(guild_id, None)
+                    self.logger.info(
+                        f"Auto-left {bot_vc.name} in {guild.name} (No human members left)"
+                    )
+
+    # ------------------------------------------------------------------
+    # 自動参加設定コマンド
+    # ------------------------------------------------------------------
+    @app_commands.command(
+        name="autojoin", description="自動参加するボイスチャンネルと読み上げテキストチャンネルを設定します。"
+    )
+    @app_commands.describe(
+        voice_channel="自動参加対象のボイスチャンネル",
+        text_channel="読み上げ対象のテキストチャンネル (指定しない場合は現在のチャンネル)",
+    )
+    async def set_autojoin(
+        self,
+        interaction: discord.Interaction,
+        voice_channel: discord.VoiceChannel,
+        text_channel: discord.TextChannel | None = None,
+    ) -> None:
+        await interaction.response.defer()
+        guild = interaction.guild
+        if not guild:
+            await interaction.followup.send("サーバー内でのみ実行可能です。", ephemeral=True)
+            return
+
+        target_text = text_channel or interaction.channel
+        if not isinstance(target_text, discord.TextChannel):
+            await interaction.followup.send("有効なテキストチャンネルを指定してください。", ephemeral=True)
+            return
+
+        self.config_store.set_auto_join_config(
+            guild_id=guild.id,
+            voice_channel_id=voice_channel.id,
+            text_channel_id=target_text.id,
+        )
+
+        await interaction.followup.send(
+            f"自動参加設定を更新しました！\n"
+            f"・対象VC: **{voice_channel.name}**\n"
+            f"・読み上げテキスト: **{target_text.name}**"
+        )
+
+    # ------------------------------------------------------------------
+    # 既存コマンド (join / skip / leave)
+    # ------------------------------------------------------------------
     @app_commands.command(name="join", description="ボイスチャンネルに参加します。")
     async def join(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer()
@@ -200,13 +309,17 @@ class VoiceCog(commands.Cog):
             se_path = self.se_keywords.get(content)
             if se_path:
                 await self.audio_engine.enqueue_play_waiting({
-                    "guild_id": guild_id, "group_id": group_id, "file_path": se_path,
-                    "sequence_number": seq_idx, "total_segments": total_segments, "effects": effects,
+                    "guild_id": guild_id,
+                    "group_id": group_id,
+                    "file_path": se_path,
+                    "sequence_number": seq_idx,
+                    "total_segments": total_segments,
+                    "effects": effects,
                 })
             else:
                 cache_path = self.audio_engine.cache_manager.get_cache_path(content, style_uuid)
-                # 1. os.path.exists ではなく Path オブジェクトの exists() を使う
                 if cache_path.exists():
+                    # 1. キャッシュが存在するなら、保存済み音声ファイルを直接再生！
                     await self.audio_engine.enqueue_play_waiting({
                         "guild_id": guild_id, 
                         "group_id": group_id, 
@@ -215,9 +328,16 @@ class VoiceCog(commands.Cog):
                         "total_segments": total_segments, 
                         "effects": effects,
                     })
+                else:
+                    # 2. キャッシュがない場合のみ、音声合成APIを呼び出すキューに追加！
                     await self.audio_engine.enqueue({
-                        "guild_id": guild_id, "group_id": group_id, "author_id": message.author.id,
-                        "content": content, "sequence_number": seq_idx, "total_segments": total_segments, "effects": effects,
+                        "guild_id": guild_id,
+                        "group_id": group_id,
+                        "author_id": message.author.id,
+                        "content": content,
+                        "sequence_number": seq_idx,
+                        "total_segments": total_segments,
+                        "effects": effects,
                     })
 
         self.last_speaker_id[guild_id] = message.author.id
