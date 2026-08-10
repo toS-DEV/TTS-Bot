@@ -1,32 +1,22 @@
 import asyncio
-import json
 import logging
 import os
-from collections import OrderedDict
 from collections.abc import Callable
-from contextlib import suppress
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, TypedDict, cast
 
 import discord
-import requests
 from discord import app_commands
-from discord.ext import commands, tasks
-from typing_extensions import NotRequired, override
+from discord.ext import commands
+from typing_extensions import override
 
 import logic
 from cache_manager import VoiceCacheManager
 from dictionary_manager import DictionaryManager
 from models import Models
-from services.audio_engine import TTSQueueItem
+from services.audio_engine import AudioEngine, TTSQueueItem
 from services.bump_server import BumpServer
 from services.config_store import ConfigStore
-
-
-class BumpNotificationData(TypedDict):
-    guild_id: NotRequired[int | str | None]
-    message: NotRequired[str | None]
 
 
 class VoiceStyle(TypedDict):
@@ -41,22 +31,12 @@ class TTSCog(commands.Cog):
     text_channels: dict[int, discord.TextChannel]
     voice_clients: dict[int, discord.VoiceClient]
     voice_channels: dict[int, discord.VoiceChannel]
-    queue: asyncio.Queue[TTSQueueItem] | None
-    is_reading: dict[int, bool]
-    _queue_lock: asyncio.Lock | None
     dict_manager: DictionaryManager
     cache_manager: VoiceCacheManager
     last_speaker_id: dict[int, int]
     last_speak_time: dict[int, datetime]
-    play_waiting_queue: asyncio.Queue[TTSQueueItem]
     owner_id: int
     owner_display_name: str
-    next_event: asyncio.Event | None
-    api_semaphore: asyncio.Semaphore
-
-    play_groups: dict[int, dict[str, Any]]
-    play_group_counters: dict[int, int]
-    play_wait_start: dict[int, dict[str, float | None]]
 
     def __init__(self, bot: commands.Bot, logger: logging.Logger):
         super().__init__()
@@ -64,49 +44,39 @@ class TTSCog(commands.Cog):
         self.logger = logging.getLogger("bot.ttscog")
 
         self.config_store = ConfigStore(logger=self.logger)
+        self.cache_manager = VoiceCacheManager(max_size_mb=2048)
+        self.dict_manager = DictionaryManager()
 
         self.text_channels = {}
         self.voice_clients = {}
         self.voice_channels = {}
-        self.is_reading = {}
         self.last_speaker_id = {}
         self.last_speak_time = {}
-        self.dict_manager = DictionaryManager()
-        self.cache_manager = VoiceCacheManager(max_size_mb=2048)
         self.owner_id = int(os.getenv("OWNER_ID", "0"))
         self.owner_display_name = os.getenv("OWNER_DISPLAY_NAME", "マスター")
-        self.queue = asyncio.Queue()
-        self.play_waiting_queue = asyncio.Queue()
-        self._queue_lock = asyncio.Lock()
-        self.next_event = asyncio.Event()
-        self.api_semaphore = asyncio.Semaphore(1)
-        self.play_groups = {}
-        self.play_group_counters = {}
-        self.play_wait_start = {}
-        self.loop = bot.loop
+
+        # AudioEngine の初期化
+        self.audio_engine = AudioEngine(
+            bot=self.bot,
+            cache_manager=self.cache_manager,
+            get_style_fn=self.get_style,
+            get_voice_client_fn=lambda g_id: self.voice_clients.get(g_id),
+            logger=self.logger,
+        )
+
         self.se_dir = "Extra/EX_Voice"
         self._update_se_keywords()
-        self._http_server_task: asyncio.Task | None = None
 
     async def _enqueue_bump_item(self, item: TTSQueueItem) -> None:
         """BumpServerからのアイテムを安全にキューへ追加する"""
-        if self.queue is not None:
-            await self.queue.put(item)
-        else:
-            self.logger.warning("Queue is not initialized. Dropping bump item.")
+        await self.audio_engine.enqueue(item)
 
     @override
     async def cog_load(self) -> None:
         logger = self.logger.getChild("cog_load")
-        self.queue = asyncio.Queue()
-        self.play_waiting_queue = asyncio.Queue()
-        self._queue_lock = asyncio.Lock()
-        self.next_event = asyncio.Event()
-        self.api_semaphore = asyncio.Semaphore(1)
-        if not self.generation_loop.is_running():
-            self.generation_loop.start()
-        if not self.playback_loop.is_running():
-            self.playback_loop.start()
+
+        # 音声エンジンのループ開始
+        self.audio_engine.start()
 
         self.bump_server = BumpServer(
             bot=self.bot,
@@ -128,59 +98,6 @@ class TTSCog(commands.Cog):
                     name = os.path.splitext(file)[0]
                     self.se_keywords[name] = os.path.join(se_dir, file)
 
-    async def _play_audio_and_wait(
-        self,
-        vc: discord.VoiceClient,
-        audio_path: str,
-        next_audio_path: str | None = None,
-        playback_timeout: float = 30.0,
-        effects: dict[str, bool] | None = None,
-    ) -> None:
-        """再生して終了まで待機する。"""
-        if not vc or not vc.is_connected():
-            return
-
-        if audio_path is None or not os.path.exists(audio_path):
-            self.logger.warning(f"Audio path is invalid or missing: {audio_path}")
-            return
-
-        local_event = asyncio.Event()
-
-        ffmpeg_filters = logic.build_ffmpeg_options(effects)
-
-        ffmpeg_options = "-loglevel panic"
-        if ffmpeg_filters:
-            ffmpeg_options += f" {ffmpeg_filters}"
-
-        try:
-            current_source = discord.FFmpegPCMAudio(
-                audio_path,
-                before_options="-channel_layout mono",
-                options=ffmpeg_options,
-            )
-
-            vc.play(
-                current_source,
-                after=lambda e: self.bot.loop.call_soon_threadsafe(local_event.set),
-            )
-        except (discord.ClientException, OSError) as e:
-            self.logger.error(f"Failed to start playback for {audio_path}: {e}")
-            return
-
-        try:
-            await asyncio.wait_for(local_event.wait(), timeout=playback_timeout)
-        except asyncio.TimeoutError:
-            self.logger.warning(f"Playback timeout for {audio_path}. Stopping.")
-            if vc.is_playing():
-                try:
-                    vc.stop()
-                except (discord.ClientException, OSError) as e:
-                    self.logger.debug(f"Failed to stop VC smoothly: {e}")
-        except Exception as e:  # noqa: BLE001
-            self.logger.error(f"Unexpected error during playback wait: {e}")
-        finally:
-            await asyncio.sleep(0.01)
-
     async def _put_announcement(self, guild_id: int, text: str):
         try:
             guild = self.bot.get_guild(guild_id)
@@ -197,13 +114,13 @@ class TTSCog(commands.Cog):
                     "total_segments": 1,
                 },
             )
-            if self.queue:
-                await self.queue.put(data)
+            await self.audio_engine.enqueue(data)
         except Exception:
             self.logger.exception("Failed to enqueue auto-join announcement")
 
     def on_close(self) -> None:
         logger = self.logger.getChild("on_close")
+        self.audio_engine.stop()
         self.config_store.save_prefs()
         logger.info("TTSCog Closed")
 
@@ -295,8 +212,7 @@ class TTSCog(commands.Cog):
             },
         )
 
-        if self.queue is not None:
-            await self.queue.put(join_data)
+        await self.audio_engine.enqueue(join_data)
 
     @app_commands.command(
         name="skip",
@@ -320,23 +236,9 @@ class TTSCog(commands.Cog):
         vc = self.voice_clients.get(guild_id)
         if vc and vc.is_playing() and is_admin:
             vc.stop()
-            await interaction.followup.send(
-                "管理者の権限で現在の再生を停止したよ。"
-            )
-        if self.queue and not self.queue.empty():
-            temp_list = []
-            while not self.queue.empty():
-                try:
-                    item = self.queue.get_nowait()
-                    if not is_admin and item.get("author_id") != author_id:
-                        temp_list.append(item)
-                except asyncio.QueueEmpty:
-                    break
-            for item in temp_list:
-                await self.queue.put(item)
+            await interaction.followup.send("管理者の権限で現在の再生を停止したよ。")
 
-        if guild_id in self.play_groups and is_admin:
-            self.play_groups.pop(guild_id, None)
+        self.audio_engine.filter_user_queue(guild_id, author_id, is_admin)
 
         await interaction.followup.send(
             f"{interaction.user.display_name}さんの未再生の読み上げキューをクリアしたよ。"
@@ -372,20 +274,18 @@ class TTSCog(commands.Cog):
                 },
             )
 
-            if self.queue is not None:
-                await self.queue.put(leave_data)
+            await self.audio_engine.enqueue(leave_data)
+            await asyncio.sleep(0.5)
 
+            max_wait = 20
+            wait_count = 0
+            while (
+                not self.audio_engine.is_empty()
+                or vc.is_playing()
+                or self.audio_engine.is_reading.get(guild_id, False)
+            ) and wait_count < max_wait:
                 await asyncio.sleep(0.5)
-
-                max_wait = 20
-                wait_count = 0
-                while (
-                    not self.queue.empty()
-                    or vc.is_playing()
-                    or self.is_reading.get(guild_id, False)
-                ) and wait_count < max_wait:
-                    await asyncio.sleep(0.5)
-                    wait_count += 1
+                wait_count += 1
 
             if vc.is_connected():
                 await vc.disconnect()
@@ -428,68 +328,6 @@ class TTSCog(commands.Cog):
             f"自動参加設定を保存しました。ボイス: {voice_channel.name}, テキスト: {text_channel.name}"
         )
 
-    async def prepare_audio(self, text, author_id):
-        """APIリクエストを行い、音声ファイルを準備してパスを返す"""
-        try:
-            style_uuid, style_id = self.get_style(author_id)
-            cache_path = self.cache_manager.get_cache_path(text, style_uuid)
-
-            if os.path.exists(cache_path):
-                return cache_path
-
-            request_body = {
-                "text": text,
-                "styleId": style_id,
-                "volumeScale": 1.0,
-                "speedScale": 1.0,
-                "pitchScale": 0.0,
-                "intonationScale": 1.0,
-                "prePhonemeLength": 0.0,
-                "postPhonemeLength": 0.0,
-                "outputSamplingRate": 48000,
-                "outputStereo": False,
-                "sampledIntervalValue": 0,
-                "adjustedF0": [],
-                "processingAlgorithm": "coeiroink",
-                "startTrimBuffer": 0,
-                "endTrimBuffer": 0,
-                "prosodyDetail": [],
-                "speakerUuid": style_uuid,
-            }
-
-            def call_api():
-                return requests.post(
-                    url="http://localhost:50032/v1/synthesis",
-                    data=json.dumps(request_body),
-                    headers={
-                        "Content-Type": "application/json",
-                        "Accept": "audio/wav",
-                    },
-                    timeout=10,
-                )
-
-            loop = asyncio.get_event_loop()
-            try:
-                async with self.api_semaphore:
-                    response = await asyncio.wait_for(
-                        loop.run_in_executor(None, call_api), timeout=30.0
-                    )
-            except asyncio.TimeoutError:
-                self.logger.error("Prepare audio timeout")
-                return None
-
-            if response.status_code == 200:
-                await asyncio.to_thread(
-                    Path(cache_path).write_bytes, response.content
-                )
-                self.cache_manager.clean_cache()
-                return cache_path
-
-            return None
-        except (requests.RequestException, OSError) as e:
-            self.logger.error(f"Prepare audio error: {e}")
-            return None
-
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         if message.author.bot or not message.guild:
@@ -499,8 +337,6 @@ class TTSCog(commands.Cog):
         if guild_id not in self.voice_clients or not message.content:
             return
         if self.text_channels.get(guild_id) != message.channel:
-            return
-        if self.queue is None:
             return
 
         member = message.author
@@ -557,10 +393,7 @@ class TTSCog(commands.Cog):
             return
 
         total_segments = len(segments)
-        cnt = self.play_group_counters.get(guild_id, 0)
-        group_id = f"legacy-{guild_id}-{cnt}"
-        self.play_group_counters[guild_id] = cnt + 1
-
+        group_id = self.audio_engine.generate_group_id(guild_id)
         style_uuid, _ = self.get_style(message.author.id)
 
         self._update_se_keywords()
@@ -568,7 +401,7 @@ class TTSCog(commands.Cog):
         for seq_idx, content in enumerate(segments):
             se_path = self.se_keywords.get(content)
             if se_path:
-                await self.play_waiting_queue.put(
+                await self.audio_engine.enqueue_play_waiting(
                     cast(
                         TTSQueueItem,
                         {
@@ -585,7 +418,7 @@ class TTSCog(commands.Cog):
 
             cache_path = self.cache_manager.get_cache_path(content, style_uuid)
             if os.path.exists(cache_path):
-                await self.play_waiting_queue.put(
+                await self.audio_engine.enqueue_play_waiting(
                     cast(
                         TTSQueueItem,
                         {
@@ -599,7 +432,7 @@ class TTSCog(commands.Cog):
                     )
                 )
             else:
-                await self.queue.put(
+                await self.audio_engine.enqueue(
                     cast(
                         TTSQueueItem,
                         {
@@ -631,262 +464,6 @@ class TTSCog(commands.Cog):
         except discord.HTTPException as e:
             self.logger.error(f"Failed to handle warning message: {e}")
 
-    @tasks.loop(seconds=0.1)
-    async def generation_loop(self):
-        if self.queue is None or self.queue.empty():
-            return
-
-        item = await self.queue.get()
-
-        try:
-            task = asyncio.create_task(self._generation_worker(item))
-            task.add_done_callback(lambda t, q=self.queue: q.task_done())
-        except Exception as e:  # noqa: BLE001
-            self.logger.error(f"Generation scheduling error: {e}")
-            with suppress(ValueError):
-                self.queue.task_done()
-
-    async def _generation_worker(self, item):
-        guild_id = item.get("guild_id")
-        author_id = item.get("author_id")
-        content = item.get("content")
-        custom_file = item.get("file_path")
-        effects = item.get("effects")
-
-        group_id = item.get("group_id")
-        if group_id is None:
-            cnt = self.play_group_counters.get(guild_id, 0)
-            group_id = f"legacy-{guild_id}-{cnt}"
-            self.play_group_counters[guild_id] = cnt + 1
-
-        try:
-            if custom_file and os.path.exists(custom_file):
-                seq = item.get("sequence_number", 0)
-                total = item.get("total_segments", 1)
-                await self.play_waiting_queue.put(
-                    cast(
-                        TTSQueueItem,
-                        {
-                            "guild_id": guild_id,
-                            "group_id": group_id,
-                            "file_path": custom_file,
-                            "sequence_number": seq,
-                            "total_segments": total,
-                            "effects": effects,
-                        },
-                    )
-                )
-                return
-
-            if content:
-                try:
-                    audio_path = await asyncio.wait_for(
-                        self.prepare_audio(content, author_id), timeout=40.0
-                    )
-                except asyncio.TimeoutError:
-                    self.logger.error(
-                        f"Generation timeout for guild {guild_id} seq={item.get('sequence_number')}"
-                    )
-                    audio_path = None
-                except Exception as e:  # noqa: BLE001
-                    self.logger.error(
-                        f"Generation error while awaiting prepare_audio: {e}"
-                    )
-                    audio_path = None
-
-                seq = item.get("sequence_number", 0)
-                total = item.get("total_segments", 1)
-
-                if audio_path:
-                    await self.play_waiting_queue.put(
-                        cast(
-                            TTSQueueItem,
-                            {
-                                "guild_id": guild_id,
-                                "group_id": group_id,
-                                "file_path": audio_path,
-                                "sequence_number": seq,
-                                "total_segments": total,
-                                "effects": effects,
-                            },
-                        )
-                    )
-                else:
-                    await self.play_waiting_queue.put(
-                        cast(
-                            TTSQueueItem,
-                            {
-                                "guild_id": guild_id,
-                                "group_id": group_id,
-                                "file_path": None,
-                                "sequence_number": seq,
-                                "total_segments": total,
-                                "effects": effects,
-                            },
-                        )
-                    )
-
-        except Exception as e:  # noqa: BLE001
-            self.logger.error(f"Generation worker error: {e}")
-
-    @tasks.loop(seconds=0.01)
-    async def playback_loop(self):
-        if not hasattr(self, "play_groups") or not hasattr(self, "play_group_counters"):
-            self.play_groups = {}
-            self.play_group_counters = {}
-            self.play_wait_start = {}
-
-        async def _drain_play_waiting() -> None:
-            try:
-                while True:
-                    try:
-                        item = self.play_waiting_queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        break
-
-                    guild_id = item.get("guild_id")
-                    if guild_id is None:
-                        with suppress(ValueError):
-                            self.play_waiting_queue.task_done()
-                        continue
-
-                    group_id = item.get("group_id")
-                    if group_id is None:
-                        cnt = self.play_group_counters.get(guild_id, 0)
-                        group_id = f"legacy-{guild_id}-{cnt}"
-                        self.play_group_counters[guild_id] = cnt + 1
-
-                    groups = self.play_groups.setdefault(guild_id, OrderedDict())
-                    if group_id not in groups:
-                        groups[group_id] = {
-                            "items": {},
-                            "next_index": 0,
-                            "total": None,
-                            "generating": True,
-                            "start_ts": None,
-                        }
-
-                    group = groups[group_id]
-                    idx = item.get("sequence_number", 0)
-                    group["items"][idx] = item
-
-                    total = item.get("total_segments")
-                    if isinstance(total, int):
-                        group["total"] = total
-                        group["generating"] = False
-
-                    if group["next_index"] == idx:
-                        group["start_ts"] = None
-                        self.play_wait_start.setdefault(guild_id, {}).pop(
-                            group_id, None
-                        )
-
-                    with suppress(ValueError):
-                        self.play_waiting_queue.task_done()
-
-            except Exception as e:  # noqa: BLE001
-                self.logger.debug(f"Drain error in playback: {e}")
-
-        await _drain_play_waiting()
-
-        for guild_id, groups in list(self.play_groups.items()):
-            if not groups:
-                continue
-
-            group_keys = list(groups.keys())
-            if not group_keys:
-                continue
-            group_id = group_keys[0]
-            group = groups[group_id]
-
-            expected_idx = group["next_index"]
-            item = group["items"].get(expected_idx)
-            if item is None:
-                await _drain_play_waiting()
-                item = group["items"].get(expected_idx)
-
-            if item is None:
-                now = asyncio.get_event_loop().time()
-                SKIP_TIMEOUT = getattr(self, "play_skip_timeout", 30.0)
-                generation_pending = group.get("generating", False)
-                currently_playing = self.is_reading.get(guild_id, False)
-
-                if not generation_pending and not currently_playing:
-                    continue
-
-                start_ts = group.get("start_ts")
-                if start_ts is None:
-                    group["start_ts"] = now
-                    self.play_wait_start.setdefault(guild_id, {})[group_id] = now
-                    continue
-                elif now - start_ts >= SKIP_TIMEOUT:
-                    self.logger.warning(
-                        f"Skipping missing idx {expected_idx} in group {group_id} guild {guild_id} (Timeout)"
-                    )
-                    group["next_index"] = expected_idx + 1
-                    group["start_ts"] = None
-                    self.play_wait_start.setdefault(guild_id, {}).pop(group_id, None)
-
-                    item = group["items"].get(group["next_index"])
-                    if item is None:
-                        continue
-
-            if item is None:
-                continue
-
-            group["start_ts"] = None
-            self.play_wait_start.setdefault(guild_id, {}).pop(group_id, None)
-
-            audio_path = item.get("file_path")
-            seq = item.get("sequence_number", 0)
-            vc = self.voice_clients.get(guild_id)
-
-            if audio_path is None:
-                group["next_index"] = expected_idx + 1
-                if (
-                    isinstance(group.get("total"), int)
-                    and group["next_index"] >= group["total"]
-                ):
-                    groups.pop(group_id, None)
-                if not group["items"] and not group.get("generating", False):
-                    groups.pop(group_id, None)
-                continue
-
-            if not (vc and vc.is_connected()):
-                continue
-
-            try:
-                self.is_reading[guild_id] = True
-                next_path = None
-                next_item = group["items"].get(seq + 1)
-                if next_item is not None:
-                    next_path = next_item.get("file_path")
-
-                await self._play_audio_and_wait(
-                    vc,
-                    audio_path,
-                    next_audio_path=next_path,
-                    effects=item.get("effects"),
-                )
-
-                group["next_index"] = expected_idx + 1
-                group["start_ts"] = None
-                self.play_wait_start.setdefault(guild_id, {}).pop(group_id, None)
-
-                total = group.get("total")
-                if isinstance(total, int) and group["next_index"] >= total:
-                    groups.pop(group_id, None)
-
-                if not group["items"] and not group.get("generating", False):
-                    groups.pop(group_id, None)
-                return
-            except Exception as e:  # noqa: BLE001
-                self.logger.error(
-                    f"Playback error in guild {guild_id}, group {group_id}: {e}"
-                )
-            finally:
-                self.is_reading[guild_id] = False
-
     @commands.Cog.listener()
     async def on_voice_state_update(
         self,
@@ -904,11 +481,6 @@ class TTSCog(commands.Cog):
         try:
             config = self.config_store.get_auto_join_config(guild_id)
             if config is not None:
-                if self.queue is None:
-                    self.queue = asyncio.Queue()
-                if self.play_waiting_queue is None:
-                    self.play_waiting_queue = asyncio.Queue()
-
                 target_vc_id = config.get("voice_channel_id")
                 target_tc_id = config.get("text_channel_id")
 
@@ -928,20 +500,9 @@ class TTSCog(commands.Cog):
                         self.voice_clients[guild_id] = vc
                         self.text_channels[guild_id] = text_channel
                         self.voice_channels[guild_id] = voice_channel
-                        self.is_reading[guild_id] = False
-                        if self.queue:
-                            while not self.queue.empty():
-                                try:
-                                    self.queue.get_nowait()
-                                except asyncio.QueueEmpty:
-                                    break
-
-                        if self.play_waiting_queue:
-                            while not self.play_waiting_queue.empty():
-                                try:
-                                    self.play_waiting_queue.get_nowait()
-                                except asyncio.QueueEmpty:
-                                    break
+                        
+                        # ギルドデータクリア
+                        self.audio_engine.clear_guild_data(guild_id)
 
                         await asyncio.sleep(0.5)
                         await self._put_announcement(
@@ -967,7 +528,6 @@ class TTSCog(commands.Cog):
 
         # --- 3. アクション判定 (参加・退出・配信) ---
         action_text = ""
-
         target_vc = self.voice_channels.get(guild_id)
 
         if target_vc:
@@ -999,36 +559,28 @@ class TTSCog(commands.Cog):
                     action_text = "がライブ配信を終了しました"
 
         if action_text:
-            if self.queue is not None:
-                await self.queue.put(
-                    cast(
-                        TTSQueueItem,
-                        {
-                            "guild_id": guild_id,
-                            "author_id": member.id,
-                            "content": f"{name_to_read}{action_text}",
-                            "sequence_number": 0,
-                            "total_segments": 1,
-                        },
-                    )
+            await self.audio_engine.enqueue(
+                cast(
+                    TTSQueueItem,
+                    {
+                        "guild_id": guild_id,
+                        "author_id": member.id,
+                        "content": f"{name_to_read}{action_text}",
+                        "sequence_number": 0,
+                        "total_segments": 1,
+                    },
                 )
-            else:
-                self.logger.warning(
-                    "Queue is not initialized. Skipping action notification."
-                )
+            )
 
         # --- 4. 自動切断処理 ---
         if self.bot.user and member.id == self.bot.user.id:
             return
 
         left_channel = before.channel
-
         if left_channel is not None and guild_id in self.voice_clients:
             managed_channel = self.voice_channels.get(guild_id)
-
             if managed_channel and left_channel.id == managed_channel.id:
                 human_members = [m for m in left_channel.members if not m.bot]
-
                 if len(human_members) == 0:
                     await self.immediate_disconnect(guild_id)
 
@@ -1045,31 +597,8 @@ class TTSCog(commands.Cog):
             except Exception as e:  # noqa: BLE001
                 self.logger.error(f"Failed to disconnect cleanly: {e}")
 
-        self.is_reading[guild_id] = False
-
-        if hasattr(self, "play_groups") and guild_id in self.play_groups:
-            self.play_groups.pop(guild_id, None)
-        if (
-            hasattr(self, "play_group_counters")
-            and guild_id in self.play_group_counters
-        ):
-            self.play_group_counters.pop(guild_id, None)
-        if hasattr(self, "play_wait_start") and guild_id in self.play_wait_start:
-            self.play_wait_start.pop(guild_id, None)
-
-        if self.queue:
-            while not self.queue.empty():
-                try:
-                    self.queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
-
-        if self.play_waiting_queue:
-            while not self.play_waiting_queue.empty():
-                try:
-                    self.play_waiting_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
+        # エンジン側のギルドデータクリア
+        self.audio_engine.clear_guild_data(guild_id)
 
         if guild_id in self.text_channels:
             try:
