@@ -10,11 +10,13 @@ from dotenv import load_dotenv
 
 from cogs.config import ConfigCog
 from cogs.dictionary import DictionaryCog
+from cogs.user_dictionary import UserDictionaryCog
 from cogs.voice import VoiceCog
 from services.audio_engine import AudioEngine
 from services.bump_server import BumpServer
 from services.cache_manager import VoiceCacheManager
 from services.dictionary_manager import DictionaryManager
+from services.user_dictionary_manager import UserDictionaryManager
 
 _ = load_dotenv()
 
@@ -29,6 +31,7 @@ class MyBot(commands.Bot):
         # 共通マネージャー・サービスの初期化
         self.cache_manager = VoiceCacheManager(max_size_mb=2048)
         self.dict_manager = DictionaryManager()
+        self.user_dict_manager = UserDictionaryManager()
         self.voice_cog: VoiceCog | None = None
 
         # AudioEngine の初期化（VoiceCog の voice_clients を安全に参照）
@@ -73,10 +76,15 @@ class MyBot(commands.Bot):
         # 2. Cog の追加（明示的にインスタンス化して追加）
         config_cog = ConfigCog(self, self.logger)
         dict_cog = DictionaryCog(self, dict_manager=self.dict_manager)
-        self.voice_cog = VoiceCog(self, self.audio_engine, self.logger)
+        user_dict_cog = UserDictionaryCog(self, user_dict_manager=self.user_dict_manager)
+        
+        self.voice_cog = VoiceCog(
+            self, self.audio_engine, self.logger, user_dict_manager=self.user_dict_manager
+        )
 
         await self.add_cog(config_cog)
         await self.add_cog(dict_cog)
+        await self.add_cog(user_dict_cog)
         await self.add_cog(self.voice_cog)
         logger.info("Successfully loaded ConfigCog and VoiceCog")
 

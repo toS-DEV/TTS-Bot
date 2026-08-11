@@ -13,6 +13,7 @@ from models.voice_style import Models
 from services.audio_engine import AudioEngine
 from services.config_store import ConfigStore
 from services.dictionary_manager import DictionaryManager
+from services.user_dictionary_manager import UserDictionaryManager
 
 
 class VoiceStyle(TypedDict):
@@ -23,21 +24,24 @@ class VoiceStyle(TypedDict):
 class VoiceCog(commands.Cog):
     """VCの参加・切断・読み上げイベント監視を行う Cog"""
 
-    def __init__(self, bot: commands.Bot, audio_engine: AudioEngine, logger: logging.Logger):
+    def __init__(
+        self,
+        bot: commands.Bot,
+        audio_engine: AudioEngine,
+        logger: logging.Logger,
+        user_dict_manager: UserDictionaryManager | None = None,
+    ):
         self.bot = bot
         self.audio_engine = audio_engine
         self.logger = logger.getChild("voice")
         self.config_store = ConfigStore(logger=self.logger)
         self.dict_manager = DictionaryManager()
-
+        self.user_dict_manager = user_dict_manager or getattr(bot, "user_dict_manager", None)
         self.text_channels: dict[int, discord.TextChannel] = {}
         self.voice_clients: dict[int, discord.VoiceClient] = {}
         self.voice_channels: dict[int, discord.VoiceChannel] = {}
         self.last_speaker_id: dict[int, int] = {}
         self.last_speak_time: dict[int, datetime] = {}
-
-        self.owner_id = int(os.getenv("OWNER_ID", "0"))
-        self.owner_display_name = os.getenv("OWNER_DISPLAY_NAME", "マスター")
 
         self.se_dir = "Extra/EX_Voice"
         self._update_se_keywords()
@@ -291,20 +295,27 @@ class VoiceCog(commands.Cog):
             raw_segments = raw_segments[:50]
             raw_segments.append("以下略。")
 
-        # 3. (テキスト, エフェクト) のペアを格納するリストを作成
-        # (テキスト, エフェクト) のペアを格納するリスト
         segments_with_effects: list[tuple[str, dict[str, bool]]] = []
 
-        # 連続発言でない場合は名前を追加 (名前にはエフェクトなし)
+        # 連続発言でない場合は名前を追加
         if not is_continuous:
-            if message.author.id == self.owner_id:
-                name = f"{logic.process_name(self.owner_display_name, self.dict_manager)}さん。 "
+            user_reading, user_effect = (
+                self.user_dict_manager.get_user_data(message.author.id)
+                if self.user_dict_manager
+                else (None, None)
+            )
+
+            name_effects: dict[str, bool] = {}
+            if user_effect:
+                name_effects[user_effect] = True
+
+            if user_reading:
+                name = f"{user_reading}。 "
             else:
                 clean_name = logic.process_name(message.author.display_name, self.dict_manager)
                 name = f"{clean_name if clean_name else '名無し'}さん。 "
-            segments_with_effects.append((name, {}))
 
-        # ★ 行単位（改行）でループ処理する
+            segments_with_effects.append((name, name_effects))
         lines = message.content.splitlines()
 
         for line in lines:
