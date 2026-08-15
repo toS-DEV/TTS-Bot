@@ -21,6 +21,7 @@ class TTSQueueItem(TypedDict, total=False):
     group_id: str
     author_id: int
     content: str
+    style_uuid: str
     file_path: str | None
     sequence_number: int
     total_segments: int
@@ -87,7 +88,7 @@ class AudioEngine:
         try:
             style_uuid, style_id = self.get_style_fn(author_id)
             cache_path = self.cache_manager.get_cache_path(text, style_uuid)
-                
+
             if cache_path.exists():
                 return str(cache_path)
 
@@ -136,7 +137,7 @@ class AudioEngine:
                 # 1. cache_path は既に Path なのでそのまま write_bytes を渡せるよ
                 await asyncio.to_thread(cache_path.write_bytes, response.content)
                 self.cache_manager.clean_cache()
-                
+
                 # 2. 関数の戻り値型 (str | None) に合わせて str にキャストして返す！
                 return str(cache_path)
 
@@ -317,6 +318,8 @@ class AudioEngine:
                     total = item.get("total_segments")
                     if isinstance(total, int):
                         group["total"] = total
+
+                    if isinstance(group["total"], int) and len(group["items"]) >= group["total"]:
                         group["generating"] = False
 
                     if group["next_index"] == idx:
