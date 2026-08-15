@@ -260,22 +260,36 @@ class VoiceCog(commands.Cog):
             await interaction.followup.send("有効なテキスト/ボイスチャンネルで実行してください。", ephemeral=True)
             return
 
+        # 1. 音声エンジンのループを開始（安全策）
+        self.audio_engine.start()
+
+        # 2. VC接続・移動処理
         if guild.voice_client is None:
             vc = await channel.connect()
             await interaction.followup.send(f"【{channel.name}】に接続しました。")
         else:
             vc = cast(discord.VoiceClient, guild.voice_client)
-            await interaction.followup.send("すでに接続しています。", ephemeral=True)
+            if vc.channel and vc.channel.id != channel.id:
+                await vc.move_to(channel)
+                await interaction.followup.send(f"【{channel.name}】に移動しました。")
+            else:
+                await interaction.followup.send("すでに接続しています。", ephemeral=True)
 
         guild_id = guild.id
         self.text_channels[guild_id] = text_channel
         self.voice_clients[guild_id] = vc
         self.voice_channels[guild_id] = channel
 
+        # 3. style_uuid と group_id を取得してキューに投入
+        style_uuid, _ = self.get_style(guild.me.id)
+        group_id = self.audio_engine.generate_group_id(guild_id)
+
         await self.audio_engine.enqueue({
             "guild_id": guild_id,
+            "group_id": group_id,
             "author_id": guild.me.id,
             "content": f"【{channel.name}】に参加しました。",
+            "style_uuid": style_uuid,
             "sequence_number": 0,
             "total_segments": 1,
         })
@@ -391,62 +405,77 @@ class VoiceCog(commands.Cog):
             if not line.strip():
                 continue
 
-            # 1. まず「行頭記号 (#, ##, ###, -#, >)」を抽出・除去
+            # 1. 行頭記号 (#, ##, ###, -#, >) の抽出（行全体にかかるエフェクト）
             line_text, line_effects = logic.extract_line_effects(line)
 
-            # 2. テキストの基本整形（辞書適用や文字置換など）
-            processed_line = logic.process_text(line_text, message.guild, self.dict_manager, self.bot)
+            # 2. 行テキストを装飾区間（スパン）ごとに分解
+            spans = logic.parse_inline_spans(line_text)
 
-            # 3. 句読点などで細かくセグメント分割
-            raw_segments = [s for s in logic.split_text(processed_line) if s.strip()]
+            # 3. 各スパンごとにテキスト整形 & 句読点分割
+            for text_chunk, inline_effects in spans:
+                # 行頭エフェクトとスパンのエフェクトを合体
+                combined_effects = {**line_effects, **inline_effects}
 
-            # 4. 各セグメントに対して「インライン記号 (**, ~~ など)」を抽出
-            for seg in raw_segments:
-                clean_seg, inline_effects = logic.extract_inline_effects(seg)
-                if clean_seg.strip():
-                    # 行頭エフェクトとインラインエフェクトを合体！
-                    combined_effects = {**line_effects, **inline_effects}
-                    segments_with_effects.append((clean_seg, combined_effects))
+                # テキストの基本整形（辞書適用や文字置換など）
+                processed_chunk = logic.process_text(text_chunk, message.guild, self.dict_manager, self.bot)
 
+                # 句読点などで細かくセグメント分割
+                raw_segments = [s for s in logic.split_text(processed_chunk) if s.strip()]
+
+                for seg in raw_segments:
+                    segments_with_effects.append((seg, combined_effects))
+                        
         if not segments_with_effects:
             return
 
         total_segments = len(segments_with_effects)
         group_id = self.audio_engine.generate_group_id(guild_id)
+        
+        # ユーザーごとのボイススタイルを取得
         style_uuid, _ = self.get_style(message.author.id)
 
         for seq_idx, (content, effects) in enumerate(segments_with_effects):
             se_path = self.se_keywords.get(content)
+
             if se_path:
-                await self.audio_engine.enqueue_play_waiting({
-                    "guild_id": guild_id,
-                    "group_id": group_id,
-                    "file_path": se_path,
-                    "sequence_number": seq_idx,
-                    "total_segments": total_segments,
-                    "effects": effects,
-                })
+                # 1. SE（効果音）の直接再生
+                await self.audio_engine.enqueue_play_waiting(
+                    {
+                        "guild_id": guild_id,
+                        "group_id": group_id,
+                        "file_path": se_path,
+                        "sequence_number": seq_idx,
+                        "total_segments": total_segments,
+                        "effects": cast(dict[str, bool] | None, effects),
+                    }
+                )
             else:
                 cache_path = self.audio_engine.cache_manager.get_cache_path(content, style_uuid)
                 if cache_path.exists():
-                    await self.audio_engine.enqueue_play_waiting({
-                        "guild_id": guild_id,
-                        "group_id": group_id,
-                        "file_path": str(cache_path),
-                        "sequence_number": seq_idx,
-                        "total_segments": total_segments,
-                        "effects": effects,
-                    })
+                    # 2. キャッシュが存在する場合は直接再生キューへ
+                    await self.audio_engine.enqueue_play_waiting(
+                        {
+                            "guild_id": guild_id,
+                            "group_id": group_id,
+                            "file_path": str(cache_path),
+                            "sequence_number": seq_idx,
+                            "total_segments": total_segments,
+                            "effects": cast(dict[str, bool] | None, effects),
+                        }
+                    )
                 else:
-                    await self.audio_engine.enqueue({
-                        "guild_id": guild_id,
-                        "group_id": group_id,
-                        "author_id": message.author.id,
-                        "content": content,
-                        "sequence_number": seq_idx,
-                        "total_segments": total_segments,
-                        "effects": effects,
-                    })
+                    await self.audio_engine.enqueue(
+                        {
+                            "guild_id": guild_id,
+                            "group_id": group_id,
+                            "author_id": message.author.id,
+                            "content": content,
+                            "style_uuid": style_uuid,
+                            "sequence_number": seq_idx,
+                            "total_segments": total_segments,
+                            "effects": cast(dict[str, bool] | None, effects),
+                        }
+                    )
 
         self.last_speaker_id[guild_id] = message.author.id
         self.last_speak_time[guild_id] = now

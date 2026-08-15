@@ -74,26 +74,37 @@ class VoiceCacheManager:
         deleted_count = 0
 
         # メタデータファイル(.json)を検索
-        for meta_file in self.cache_dir.glob("*.json"):
+        for meta_file in list(self.cache_dir.glob("*.json")):
             if not meta_file.is_file():
                 continue
 
             try:
+                # 1. まずファイルを開いて中身を読む（withブロックを出て確実にファイルを閉じる）
                 with meta_file.open("r", encoding="utf-8") as f:
                     data = json.load(f)
 
                 cached_text = data.get("text", "").lower()
 
-                # 登録単語が元のテキストに含まれていたら削除！
+                # 2. 登録単語が含まれているか判定
                 if target_word in cached_text:
                     wav_file = meta_file.with_suffix(".wav")
                     
+                    # 3. wavファイルがあれば削除（失敗してもjsonの削除へ進めるように分離）
                     if wav_file.exists():
-                        wav_file.unlink()
-                    meta_file.unlink()
-                    
+                        try:
+                            wav_file.unlink()
+                        except OSError as e:
+                            self.logger.error(f"WAVファイル削除失敗 ({wav_file.name}): {e}")
+
+                    # 4. jsonファイル（メタデータ）を削除
+                    try:
+                        meta_file.unlink()
+                    except OSError as e:
+                        self.logger.error(f"JSONファイル削除失敗 ({meta_file.name}): {e}")
+
                     deleted_count += 1
+
             except (json.JSONDecodeError, OSError) as e:
-                self.logger.error(f"キャッシュ削除中のエラー: {e}")
+                self.logger.error(f"キャッシュ検索中のエラー ({meta_file.name}): {e}")
 
         return deleted_count

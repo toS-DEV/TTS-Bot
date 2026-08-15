@@ -111,40 +111,56 @@ def extract_line_effects(line: str) -> tuple[str, dict[str, bool]]:
 
     return line, effects
 
-def extract_inline_effects(text: str) -> tuple[str, dict[str, bool]]:
-    """インラインのMarkdown記法（**, *, ~~, ||, `）を検出・除去し、エフェクトフラグを返す"""
-    effects = {
-        "loud": False,
-        "fast": False,
-        "low": False,
-        "spoiler": False,
-        "code": False,
-    }
+def parse_inline_spans(text: str) -> list[tuple[str, dict[str, bool]]]:
+    """テキストをインラインMarkdownの装飾区間ごとに分割し、各区間のテキストとエフェクトを返す"""
+    # インライン記法（**, ~~, ||, `, *, _）にマッチする正規表現
+    pattern = r"(\*\*.*?\*\*|~~.*?~~|\|\|.*?\|\||`.*?`|(?:\*|_).*?(?:\*|_))"
+    raw_chunks = re.split(pattern, text)
 
-    if not text:
-        return "", effects
+    results: list[tuple[str, dict[str, bool]]] = []
 
-    if re.search(r"\*\*.*?\*\*", text):
-        effects["loud"] = True
-        text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
+    for chunk in raw_chunks:
+        if not chunk:
+            continue
 
-    if re.search(r"(\*|_).*?(\*|_)", text):
-        effects["fast"] = True
-        text = re.sub(r"(\*|_)(.*?)\1", r"\2", text)
+        effects = {
+            "loud": False,
+            "fast": False,
+            "low": False,
+            "spoiler": False,
+            "code": False,
+        }
+        clean_text = chunk
 
-    if re.search(r"~~.*?~~", text):
-        effects["low"] = True
-        text = re.sub(r"~~(.*?)~~", r"\1", text)
+        # ネストされた記号も含めて外側から剥がしながらエフェクトを判定
+        changed = True
+        while changed:
+            changed = False
+            if len(clean_text) >= 4 and clean_text.startswith("**") and clean_text.endswith("**"):
+                effects["loud"] = True
+                clean_text = clean_text[2:-2]
+                changed = True
+            elif len(clean_text) >= 4 and clean_text.startswith("~~") and clean_text.endswith("~~"):
+                effects["low"] = True
+                clean_text = clean_text[2:-2]
+                changed = True
+            elif len(clean_text) >= 4 and clean_text.startswith("||") and clean_text.endswith("||"):
+                effects["spoiler"] = True
+                clean_text = clean_text[2:-2]
+                changed = True
+            elif len(clean_text) >= 2 and clean_text.startswith("`") and clean_text.endswith("`"):
+                effects["code"] = True
+                clean_text = clean_text[1:-1]
+                changed = True
+            elif len(clean_text) >= 2 and clean_text.startswith(("*", "_")) and clean_text.endswith(("*", "_")):
+                effects["fast"] = True
+                clean_text = clean_text[1:-1]
+                changed = True
 
-    if re.search(r"\|\|.*?\|\|", text):
-        effects["spoiler"] = True
-        text = re.sub(r"\|\|(.*?)\|\|", r"\1", text)
+        if clean_text:
+            results.append((clean_text, effects))
 
-    if re.search(r"`.*?`", text):
-        effects["code"] = True
-        text = re.sub(r"`(.*?)`", r"\1", text)
-
-    return text, effects
+    return results
 
 def extract_markdown_effects(text: str) -> tuple[str, dict[str, bool]]:
     """Markdown記法を検出し、エフェクトフラグと記号除去後のテキストを返す"""
