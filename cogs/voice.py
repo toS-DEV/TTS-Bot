@@ -13,6 +13,7 @@ from models.voice_style import Models
 from services.audio_engine import AudioEngine
 from services.config_store import ConfigStore
 from services.dictionary_manager import DictionaryManager
+from services.user_dictionary_manager import UserDictionaryManager
 
 
 class VoiceStyle(TypedDict):
@@ -23,21 +24,24 @@ class VoiceStyle(TypedDict):
 class VoiceCog(commands.Cog):
     """VCの参加・切断・読み上げイベント監視を行う Cog"""
 
-    def __init__(self, bot: commands.Bot, audio_engine: AudioEngine, logger: logging.Logger):
+    def __init__(
+        self,
+        bot: commands.Bot,
+        audio_engine: AudioEngine,
+        logger: logging.Logger,
+        user_dict_manager: UserDictionaryManager | None = None,
+    ):
         self.bot = bot
         self.audio_engine = audio_engine
         self.logger = logger.getChild("voice")
         self.config_store = ConfigStore(logger=self.logger)
         self.dict_manager = DictionaryManager()
-
+        self.user_dict_manager = user_dict_manager or getattr(bot, "user_dict_manager", None)
         self.text_channels: dict[int, discord.TextChannel] = {}
         self.voice_clients: dict[int, discord.VoiceClient] = {}
         self.voice_channels: dict[int, discord.VoiceChannel] = {}
         self.last_speaker_id: dict[int, int] = {}
         self.last_speak_time: dict[int, datetime] = {}
-
-        self.owner_id = int(os.getenv("OWNER_ID", "0"))
-        self.owner_display_name = os.getenv("OWNER_DISPLAY_NAME", "マスター")
 
         self.se_dir = "Extra/EX_Voice"
         self._update_se_keywords()
@@ -108,6 +112,74 @@ class VoiceCog(commands.Cog):
                             f"Failed to auto-join VC in {guild.name}"
                         )
 
+        # 2. 参加・退出・カメラ・配信通知の読み上げロジック
+        action_text = ""
+        target_vc = self.voice_channels.get(guild_id)
+
+        if target_vc:
+            # 参加
+            if (
+                before.channel is None
+                and after.channel is not None
+                and after.channel.id == target_vc.id
+            ):
+                action_text = "が参加しました"
+
+            # 退出
+            elif (
+                before.channel is not None
+                and after.channel is None
+                and before.channel.id == target_vc.id
+            ):
+                action_text = "が退出しました"
+
+            # カメラ・配信（参加・退出以外のイベントで、対象VCにいる場合）
+            elif after.channel is not None and after.channel.id == target_vc.id:
+                b_video = getattr(before, "self_video", False)
+                a_video = getattr(after, "self_video", False)
+                b_stream = getattr(before, "self_stream", False)
+                a_stream = getattr(after, "self_stream", False)
+
+                if not b_video and a_video:
+                    action_text = "がカメラを開始しました"
+                elif b_video and not a_video:
+                    action_text = "がカメラを終了しました"
+                elif not b_stream and a_stream:
+                    action_text = "がライブ配信を開始しました"
+                elif b_stream and not a_stream:
+                    action_text = "がライブ配信を終了しました"
+
+        if action_text:
+            # ユーザー辞書から読みとエフェクトを取得
+            user_reading, user_effect = (
+                self.user_dict_manager.get_user_data(member.id)
+                if self.user_dict_manager
+                else (None, None)
+            )
+
+            name_effects: dict[str, bool] = {}
+            if user_effect:
+                name_effects[user_effect] = True
+
+            if user_reading:
+                name_to_read = user_reading
+            else:
+                clean_name = logic.process_name(member.display_name, self.dict_manager)
+                name_to_read = f"{clean_name if clean_name else '名無し'}さん"
+
+            full_text = f"{name_to_read}{action_text}"
+
+            await self.audio_engine.enqueue(
+                {
+                    "guild_id": guild_id,
+                    "author_id": member.id,
+                    "content": full_text,
+                    "sequence_number": 0,
+                    "total_segments": 1,
+                    "effects": cast(dict[str, bool] | None, name_effects),
+                }
+            )
+
         # 2. 自動切断ロジック (VCにBot以外のメンバーがいなくなったとき)
         if before.channel and guild_id in self.voice_clients:
             bot_vc = self.voice_channels.get(guild_id)
@@ -125,6 +197,7 @@ class VoiceCog(commands.Cog):
                     self.logger.info(
                         f"Auto-left {bot_vc.name} in {guild.name} (No human members left)"
                     )
+
 
     # ------------------------------------------------------------------
     # 自動参加設定コマンド
@@ -291,20 +364,27 @@ class VoiceCog(commands.Cog):
             raw_segments = raw_segments[:50]
             raw_segments.append("以下略。")
 
-        # 3. (テキスト, エフェクト) のペアを格納するリストを作成
-        # (テキスト, エフェクト) のペアを格納するリスト
         segments_with_effects: list[tuple[str, dict[str, bool]]] = []
 
-        # 連続発言でない場合は名前を追加 (名前にはエフェクトなし)
+        # 連続発言でない場合は名前を追加
         if not is_continuous:
-            if message.author.id == self.owner_id:
-                name = f"{logic.process_name(self.owner_display_name, self.dict_manager)}さん。 "
+            user_reading, user_effect = (
+                self.user_dict_manager.get_user_data(message.author.id)
+                if self.user_dict_manager
+                else (None, None)
+            )
+
+            name_effects: dict[str, bool] = {}
+            if user_effect:
+                name_effects[user_effect] = True
+
+            if user_reading:
+                name = f"{user_reading}。 "
             else:
                 clean_name = logic.process_name(message.author.display_name, self.dict_manager)
                 name = f"{clean_name if clean_name else '名無し'}さん。 "
-            segments_with_effects.append((name, {}))
 
-        # ★ 行単位（改行）でループ処理する
+            segments_with_effects.append((name, name_effects))
         lines = message.content.splitlines()
 
         for line in lines:
@@ -335,7 +415,6 @@ class VoiceCog(commands.Cog):
         group_id = self.audio_engine.generate_group_id(guild_id)
         style_uuid, _ = self.get_style(message.author.id)
 
-        # ★ 修正ポイント: segments_with_effects をループして content と effects を両方取得する！
         for seq_idx, (content, effects) in enumerate(segments_with_effects):
             se_path = self.se_keywords.get(content)
             if se_path:
@@ -371,3 +450,19 @@ class VoiceCog(commands.Cog):
 
         self.last_speaker_id[guild_id] = message.author.id
         self.last_speak_time[guild_id] = now
+
+        await self.bot.process_commands(message)
+
+    async def _send_and_delete_warning(self, channel: discord.abc.Messageable) -> None:
+            """警告メッセージを送信し、10秒後に自動削除する"""
+            try:
+                warn_msg = await channel.send(
+                    "読み上げをスキップしました。読み上げるためには参加してください"
+                )
+                await asyncio.sleep(10)
+                await warn_msg.delete()
+            except discord.NotFound:
+                # 10秒経つ前にユーザーがメッセージを消していた場合のクリーンアップ
+                pass
+            except discord.HTTPException as e:
+                self.logger.error(f"Failed to handle warning message: {e}")
