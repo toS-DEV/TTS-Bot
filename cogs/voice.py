@@ -42,6 +42,7 @@ class VoiceCog(commands.Cog):
         self.voice_channels: dict[int, discord.VoiceChannel] = {}
         self.last_speaker_id: dict[int, int] = {}
         self.last_speak_time: dict[int, datetime] = {}
+        self.play_group_counters: dict[int, int] = {}
 
         self.se_dir = "Extra/EX_Voice"
         self._update_se_keywords()
@@ -70,7 +71,6 @@ class VoiceCog(commands.Cog):
     async def on_voice_state_update(
         self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState
     ) -> None:
-        """ユーザーのVC入退出を監視し、自動参加および無人切断を行う"""
         if member.bot or not member.guild:
             return
 
@@ -129,6 +129,56 @@ class VoiceCog(commands.Cog):
                     self.logger.info(
                         f"Auto-left {bot_vc.name} in {guild.name} (No human members left)"
                     )
+
+        action_text = ""
+
+        target_vc = self.voice_channels.get(guild_id)
+
+        if target_vc:
+            # 参加
+            if (
+                before.channel is None
+                and after.channel is not None
+                and after.channel.id == target_vc.id
+            ):
+                action_text = "が参加しました"
+
+            # 退出
+            elif (
+                before.channel is not None
+                and after.channel is None
+                and before.channel.id == target_vc.id
+            ):
+                action_text = "が退出しました"
+
+            # カメラ・配信（参加・退出以外のイベントで、対象VCにいる場合）
+            elif after.channel is not None and after.channel.id == target_vc.id:
+                b_video = getattr(before, "self_video", False)
+                a_video = getattr(after, "self_video", False)
+                b_stream = getattr(before, "self_stream", False)
+                a_stream = getattr(after, "self_stream", False)
+
+                if not b_video and a_video:
+                    action_text = "がカメラを開始しました"
+                elif b_video and not a_video:
+                    action_text = "がカメラを終了しました"
+                elif not b_stream and a_stream:
+                    action_text = "がライブ配信を開始しました"
+                elif b_stream and not a_stream:
+                    action_text = "がライブ配信を終了しました"
+
+        if action_text:
+            name_to_read = member.display_name
+            await self.audio_engine.enqueue(
+                {
+                    "guild_id": guild_id,
+                    "author_id": member.id,
+                    "content": f"{name_to_read}{action_text}",
+                    # イベント通知は単一セグメント
+                    "sequence_number": 0,
+                    "total_segments": 1,
+                }
+            )
 
     # ------------------------------------------------------------------
     # 自動参加設定コマンド
@@ -275,8 +325,18 @@ class VoiceCog(commands.Cog):
         if not isinstance(member, discord.Member) or not member.voice or not member.voice.channel:
             return
 
+        member = message.author
+        if (
+            not isinstance(member, discord.Member)
+            or not member.voice
+            or not member.voice.channel
+        ):
+            await self._send_and_delete_warning(message.channel)
+            return
+
         bot_vc = self.voice_channels.get(guild_id)
         if bot_vc and member.voice.channel.id != bot_vc.id:
+            await self._send_and_delete_warning(message.channel)
             return
 
         now = discord.utils.utcnow()
@@ -285,100 +345,75 @@ class VoiceCog(commands.Cog):
 
         is_continuous = (self.last_speaker_id.get(guild_id) == message.author.id and (now - last_time).total_seconds() < 60)
 
-        # 1. テキストの基本整形（文字置換や辞書適用）
-        processed_text = logic.process_text(message.content, message.guild, self.dict_manager, self.bot)
+        # --- 読み上げ対象のセグメントを構築 ---
+        segments = []
 
-        # 2. 句読点や改行で本文を文ごとに分割
-        raw_segments = [s for s in logic.split_text(processed_text) if s.strip()]
-
-        if len(raw_segments) > 50:
-            raw_segments = raw_segments[:50]
-            raw_segments.append("以下略。")
-
-        segments_with_effects: list[tuple[str, dict[str, bool]]] = []
-
-        # 連続発言でない場合は名前を追加
+        # 1. 名前の追加（連続投稿でない場合）
         if not is_continuous:
-            user_reading, user_effect = (
-                self.user_dict_manager.get_user_data(message.author.id)
-                if self.user_dict_manager
-                else (None, None)
-            )
+                    clean_name = logic.process_name(
+                        message.author.display_name, self.dict_manager
+                    )
+                    name = f"{clean_name if clean_name else '名無し'}さん。 "
+                    segments.append(name)
 
-            name_effects: dict[str, bool] = {}
-            if user_effect:
-                name_effects[user_effect] = True
+        # 2. 本文の追加
+        processed_text, effects = logic.process_text(
+            message.content, message.guild, self.dict_manager, self.bot
+        )
+        non_empty_body = [s for s in logic.split_text(processed_text) if s.strip()]
+        segments.extend(non_empty_body)
 
-            if user_reading:
-                name = f"{user_reading}。 "
-            else:
-                clean_name = logic.process_name(message.author.display_name, self.dict_manager)
-                name = f"{clean_name if clean_name else '名無し'}さん。 "
+        MAX_SEGMENTS = 10
+        if len(segments) > MAX_SEGMENTS:
+            # 設定数に切り詰めて、最後に「以下略」などを付け足す
+            segments = segments[:MAX_SEGMENTS]
+            segments.append("以下略。")
 
-            segments_with_effects.append((name, name_effects))
-        lines = message.content.splitlines()
-
-        for line in lines:
-            if not line.strip():
-                continue
-
-            # 1. まず「行頭記号 (#, ##, ###, -#, >)」を抽出・除去
-            line_text, line_effects = logic.extract_line_effects(line)
-
-            # 2. テキストの基本整形（辞書適用や文字置換など）
-            processed_line = logic.process_text(line_text, message.guild, self.dict_manager, self.bot)
-
-            # 3. 句読点などで細かくセグメント分割
-            raw_segments = [s for s in logic.split_text(processed_line) if s.strip()]
-
-            # 4. 各セグメントに対して「インライン記号 (**, ~~ など)」を抽出
-            for seg in raw_segments:
-                clean_seg, inline_effects = logic.extract_inline_effects(seg)
-                if clean_seg.strip():
-                    # 行頭エフェクトとインラインエフェクトを合体！
-                    combined_effects = {**line_effects, **inline_effects}
-                    segments_with_effects.append((clean_seg, combined_effects))
-
-        if not segments_with_effects:
+        if not segments:
             return
 
-        total_segments = len(segments_with_effects)
-        group_id = self.audio_engine.generate_group_id(guild_id)
-        style_uuid, _ = self.get_style(message.author.id)
+        # --- キュー投入処理の共通化 ---
+        total_segments = len(segments)
+        cnt = self.play_group_counters.get(guild_id, 0)
+        group_id = f"legacy-{guild_id}-{cnt}"
+        self.play_group_counters[guild_id] = cnt + 1
 
-        # ★ 修正ポイント: segments_with_effects をループして content と effects を両方取得する！
-        for seq_idx, (content, effects) in enumerate(segments_with_effects):
+        self._update_se_keywords()
+
+        for seq_idx, content in enumerate(segments):
+            # SEキーならパスが入り、そうでなければ None になる
             se_path = self.se_keywords.get(content)
-            if se_path:
-                await self.audio_engine.enqueue_play_waiting({
+
+            # キャッシュチェックもSE分岐もすべて AudioEngine に委託する
+            await self.audio_engine.enqueue(
+                {
                     "guild_id": guild_id,
                     "group_id": group_id,
+                    "author_id": message.author.id,
+                    "content": content,
                     "file_path": se_path,
                     "sequence_number": seq_idx,
                     "total_segments": total_segments,
-                    "effects": effects,
-                })
-            else:
-                cache_path = self.audio_engine.cache_manager.get_cache_path(content, style_uuid)
-                if cache_path.exists():
-                    await self.audio_engine.enqueue_play_waiting({
-                        "guild_id": guild_id,
-                        "group_id": group_id,
-                        "file_path": str(cache_path),
-                        "sequence_number": seq_idx,
-                        "total_segments": total_segments,
-                        "effects": effects,
-                    })
-                else:
-                    await self.audio_engine.enqueue({
-                        "guild_id": guild_id,
-                        "group_id": group_id,
-                        "author_id": message.author.id,
-                        "content": content,
-                        "sequence_number": seq_idx,
-                        "total_segments": total_segments,
-                        "effects": effects,
-                    })
+                    "effects": cast(dict[str, bool] | None, effects),
+                }
+            )
 
+        # 履歴を更新
         self.last_speaker_id[guild_id] = message.author.id
         self.last_speak_time[guild_id] = now
+
+        await self.bot.process_commands(message)
+
+    async def _send_and_delete_warning(self, channel: discord.abc.Messageable) -> None:
+            """警告メッセージを送信し、10秒後に自動削除する"""
+            try:
+                warn_msg = await channel.send(
+                    "読み上げをスキップしました。読み上げるためには参加してください"
+                )
+                await asyncio.sleep(10)
+                await warn_msg.delete()
+            except discord.NotFound:
+                # 10秒経つ前にユーザーがメッセージを消していた場合のクリーンアップ
+                pass
+            except discord.HTTPException as e:
+                self.logger.error(f"Failed to handle warning message: {e}")
